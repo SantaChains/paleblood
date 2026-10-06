@@ -1,0 +1,41 @@
+cd D:\Games\bloodborne_pc
+$py = 'D:\langcode\MSYS64\clang64\bin\python.exe'
+$game = 'D:\Games\Bloodborne\Roms\CUSA03023'
+Set-Location 'D:\Games\bloodborne_pc'
+$env:PYTHONUTF8 = '1'
+
+$ini = @{}
+Get-Content bbport.ini | ForEach-Object {
+    if ($_ -match '^\s*([^#=\s]+)\s*=\s*(.*?)\s*$') { $ini[$matches[1]] = $matches[2] }
+}
+if ($ini['language']) { $env:BB_LANGUAGE = $ini['language'] }
+if ($ini['pad_swap']) { $env:BB_PAD_SWAP = $ini['pad_swap'] }
+if ($ini['gc_budget_mb']) { $env:BB_GC_BUDGET_MB = $ini['gc_budget_mb'] }
+if ($ini['present_mode']) { $env:BB_PRESENT_MODE = $ini['present_mode'] }
+
+& $py scripts\build_windows.py
+
+$merged = & $py scripts\mods.py $game --out out --mods-dir mods --config mods.json --enabled 1
+
+& $py scripts\prepare.py $merged --out out
+
+& $py scripts\link_libc.py $merged --out out
+
+& $py scripts\link_modules.py $merged --out out
+
+& $py scripts\content_profile.py $merged --out out --sku full
+
+$rr = ''
+$or = ''
+$sizes = & $py scripts\patches.py --print-scaled --settings bbport.ini
+if ($sizes -match '^\s*(\d+)\s+(\d+)\s*$') {
+    $rr = $matches[1]
+    $or = $matches[2]
+    $env:BB_DMEM_MB = '9152'
+    $env:BB_AUTO_RENDER_RES = '1'
+}
+
+& $py scripts\patches.py --out out --fps uncap --extra '' --settings bbport.ini --game-dir $merged --render-res $rr --output-res $or --patches-dir patches --patches-config patches.json
+
+$env:PATH = "D:\langcode\MSYS64\clang64\bin;$env:PATH"
+out\bb-probe.exe out\boot-linked.bin --content-profile out\content.bin --patches out\patches.bin --app0 $merged --user user --timeout 0

@@ -1,0 +1,2 @@
+/* Application icon (Explorer, taskbar). Compiled by build.sh: windres -O coff -I logo. */
+1 ICON "logo/bloodborne.ico"
