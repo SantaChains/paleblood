@@ -34,4 +34,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
 /// The menu is open: the game's input is held neutral.
 bool CapturesInput();
 
+/// The presenter feeds the driver-measured latency (VK_NV_low_latency2); negative hides it.
+void SetLatencyMs(float ms);
+
 } // namespace BbOverlay

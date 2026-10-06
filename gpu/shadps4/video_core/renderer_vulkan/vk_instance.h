@@ -294,6 +294,11 @@ public:
         return dlss_extensions;
     }
 
+    /// bbport: VK_NV_low_latency2 (NVIDIA Reflex-style low latency pacing) is available.
+    bool IsLowLatencyCapable() const {
+        return nv_low_latency;
+    }
+
     /// VK_KHR_shader_clock is supported.
     bool IsShaderSubgroupClockSupported() const {
         return shader_clock && shader_clock_features.shaderSubgroupClock;
@@ -570,6 +575,7 @@ private:
     bool compute_shader_derivatives{};
     bool mixed_float_dot_product{}; // bbport: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
     bool dlss_extensions{};         // bbport: VK_NVX_binary_import + VK_NVX_image_view_handle
+    bool nv_low_latency{};          // bbport: VK_NV_low_latency2 (Reflex-style low latency)
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};

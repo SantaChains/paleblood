@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "bbport_overlay.h"
 #include "bbport_post.h"
+#include "bbport_settings.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -157,6 +158,20 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     BbOverlay::Init(instance, swapchain.GetSurfaceFormat().format, num_images);
     BbPost::Init(instance);
 
+    // bbport: the timeline semaphore the low latency sleep signals travel on.
+    if (instance.IsLowLatencyCapable()) {
+        const vk::StructureChain semaphore_chain = {
+            vk::SemaphoreCreateInfo{},
+            vk::SemaphoreTypeCreateInfo{.semaphoreType = vk::SemaphoreType::eTimeline,
+                                        .initialValue = 0},
+        };
+        auto [semaphore_result, semaphore] =
+            instance.GetDevice().createSemaphoreUnique(semaphore_chain.get());
+        ASSERT_MSG(semaphore_result == vk::Result::eSuccess,
+                   "Failed to create the low latency sleep semaphore: {}",
+                   vk::to_string(semaphore_result));
+        latency_semaphore = std::move(semaphore);
+    }
 }
 
 Presenter::~Presenter() {
@@ -270,6 +285,9 @@ Frame* Presenter::PrepareLastFrame() {
     }
 
     Frame* frame = last_submit_frame;
+    // A re-presentation is its own latency cycle: fresh marker id (the sim window belonged
+    // to the original production).
+    frame->present_id = present_id_counter.fetch_add(1) + 1;
 
     while (true) {
         vk::Result result = instance.GetDevice().waitForFences(frame->present_done, false,
@@ -349,6 +367,26 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
 
     Frame* frame = GetRenderFrame();
+    frame->present_id = present_id_counter.fetch_add(1) + 1;
+    // bbport: the sleep armed by the previous present releases here, so frame work starts
+    // exactly when the driver wants it; this replaces the BB_FRAMES_AHEAD bound below.
+    if (latency_sleep_armed.load()) {
+        latency_sleep_armed.store(false);
+        const u64 armed_value = latency_sleep_value.load();
+        const vk::SemaphoreWaitInfo wait_info = {
+            .semaphoreCount = 1,
+            .pSemaphores = &latency_semaphore.get(),
+            .pValues = &armed_value,
+        };
+        if (instance.GetDevice().waitSemaphores(&wait_info, 1'000'000'000ull) !=
+            vk::Result::eSuccess) {
+            LOG_WARNING(Render_Vulkan, "Low latency sleep never signalled; pausing the feature");
+            latency_broken.store(true);
+        }
+    }
+    if (LowLatency()) {
+        LatencyMarker(frame, vk::LatencyMarkerNV::eSimulationStart);
+    }
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -433,17 +471,21 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
     draw_scheduler.Flush(info);
+    if (LowLatency()) {
+        LatencyMarker(frame, vk::LatencyMarkerNV::eSimulationEnd);
+    }
 
     // bbport: the GPU command thread runs at most BB_FRAMES_AHEAD (default 1) guest frames
     // ahead of the GPU: it waits here for the frame that many flips back. When the GPU is the
     // bottleneck it finishes frames at an even rate; without this bound the command thread ran
     // ahead and then blocked wherever a resource ran out, so flips (and the guest's frame
-    // timing) came in bursts: 12.5/25 ms alternation at 80 FPS. 0 turns it off.
+    // timing) came in bursts: 12.5/25 ms alternation at 80 FPS. 0 turns it off. Low latency
+    // (VK_NV_low_latency2) supersedes it: the driver's own pacing is strictly tighter.
     static const u32 frames_ahead = [] {
         const char* env = std::getenv("BB_FRAMES_AHEAD");
         return env ? u32(std::max(0, std::atoi(env))) : 1u;
     }();
-    if (frames_ahead) {
+    if (frames_ahead && !LowLatency()) {
         recent_frame_ticks.push_back(frame->ready_tick);
         while (recent_frame_ticks.size() > frames_ahead) {
             const u64 tick = recent_frame_ticks.front();
@@ -459,6 +501,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     // Request a free presentation frame.
     Frame* frame = GetRenderFrame();
+    frame->present_id = present_id_counter.fetch_add(1) + 1;
 
     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
     scheduler.EndRendering();
@@ -561,6 +604,22 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     const auto reset_result = instance.GetDevice().resetFences(frame->present_done);
     ASSERT_MSG(reset_result == vk::Result::eSuccess,
                "Unexpected error resetting present done fence: {}", vk::to_string(reset_result));
+
+    // bbport: re-arm the low latency sleep mode after a swapchain recreation, then open the
+    // presentation's latency window. On the toggle-off edge a pending sleep is dropped (the
+    // driver may never signal it, which would trip the 1 s timeout and falsely fault the
+    // feature); the enable edge clears a fault so a re-enable retries the feature.
+    const bool want_ll = BbSettings::Get().low_latency.load();
+    const bool ll_was_on = latency_mode_on.exchange(want_ll);
+    if (want_ll && !ll_was_on) {
+        latency_broken.store(false);
+    } else if (!want_ll && ll_was_on) {
+        latency_sleep_armed.store(false);
+    }
+    swapchain.ApplyLatencyMode(want_ll);
+    if (LowLatency()) {
+        LatencyMarker(frame, vk::LatencyMarkerNV::ePresentStart);
+    }
 
     // bbport: the game frame is blitted (letterboxed) straight into the swapchain image.
     const vk::Image swapchain_image = swapchain.Image();
@@ -699,10 +758,47 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     scheduler.Flush(info);
 
     // Present to swapchain.
-    {
+    const bool presented = [&] {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
-            swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        if (swapchain.Present()) {
+            return true;
+        }
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        return false;
+    }();
+    if (presented && LowLatency()) {
+        LatencyMarker(frame, vk::LatencyMarkerNV::ePresentEnd);
+        // Arm the next frame's sleep: the driver signals when frame production should start.
+        const vk::LatencySleepInfoNV sleep_info = {
+            .signalSemaphore = latency_semaphore.get(),
+            .value = latency_sleep_value.fetch_add(1) + 1,
+        };
+        latency_sleep_armed.store(instance.GetDevice().latencySleepNV(swapchain.GetHandle(),
+                                                                      sleep_info) ==
+                                  vk::Result::eSuccess);
+        // Feed the overlay readout from the driver's timing ring every 32 presents: average
+        // the valid reports (the ring's element order is unspecified, so no "newest" pick).
+        static u32 latency_reports_tick = 0;
+        if (++latency_reports_tick >= 32) {
+            latency_reports_tick = 0;
+            std::array<vk::LatencyTimingsFrameReportNV, 8> reports{};
+            vk::GetLatencyMarkerInfoNV query{};
+            query.timingCount = u32(reports.size());
+            query.pTimings = reports.data();
+            instance.GetDevice().getLatencyTimingsNV(swapchain.GetHandle(), &query);
+            const u32 count = std::min(query.timingCount, u32(reports.size()));
+            u32 valid = 0;
+            u64 total_us = 0;
+            for (u32 i = 0; i < count; ++i) {
+                const vk::LatencyTimingsFrameReportNV& report = reports[i];
+                if (report.simStartTimeUs > 0 && report.presentEndTimeUs >= report.simStartTimeUs) {
+                    total_us += report.presentEndTimeUs - report.simStartTimeUs;
+                    ++valid;
+                }
+            }
+            if (valid > 0) {
+                BbOverlay::SetLatencyMs(float(total_us / valid) / 1000.0f);
+            }
         }
     }
 
@@ -749,6 +845,15 @@ Frame* Presenter::GetRenderFrame() {
     }
 
     return frame;
+}
+
+bool Presenter::LowLatency() const {
+    return latency_semaphore && !latency_broken.load() && BbSettings::Get().low_latency.load();
+}
+
+void Presenter::LatencyMarker(Frame* frame, vk::LatencyMarkerNV marker) {
+    const vk::SetLatencyMarkerInfoNV info = {.presentID = frame->present_id, .marker = marker};
+    instance.GetDevice().setLatencyMarkerNV(swapchain.GetHandle(), info);
 }
 
 void Presenter::SetExpectedGameSize(s32 width, s32 height) {

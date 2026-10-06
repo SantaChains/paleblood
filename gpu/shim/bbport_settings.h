@@ -75,6 +75,8 @@ struct Values {
     std::atomic<bool> show_fps{false};
     /// FPS counter detail: 0 frame rate only, 1 + average ms, 2 + worst ms.
     std::atomic<int> fps_detail{2};
+    /// NVIDIA VK_NV_low_latency2 (Reflex-style) low latency mode; hot-applied per present.
+    std::atomic<bool> low_latency{false};
     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
     std::atomic<bool> fsr4_auto_exposure{true};
     std::atomic<bool> fsr4_invert_jitter{false};

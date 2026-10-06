@@ -368,6 +368,9 @@ bool Instance::CreateDevice() {
     const bool nvx_binary_import = add_extension(VK_NVX_BINARY_IMPORT_EXTENSION_NAME);
     dlss_extensions =
         add_extension(VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME) && nvx_binary_import;
+    // bbport: NVIDIA Reflex-style low latency pacing. Enabling the extension costs nothing;
+    // the runtime feature itself is toggled on the swapchain and applies from the next present.
+    nv_low_latency = add_extension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();

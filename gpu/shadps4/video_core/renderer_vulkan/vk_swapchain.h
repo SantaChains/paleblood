@@ -92,6 +92,10 @@ public:
         return needs_hdr;
     }
 
+    /// bbport: applies VK_NV_low_latency2's sleep mode to the live swapchain. No-op without the
+    /// extension or when the mode is unchanged; recreation resets it, Present re-applies.
+    void ApplyLatencyMode(bool low_latency_mode);
+
 private:
     /// Selects the best available swapchain image format
     void FindPresentFormat();
@@ -134,6 +138,7 @@ private:
     bool needs_recreation = true;
     bool needs_hdr = false;    // The game requested HDR swapchain
     bool supports_hdr = false; // SC supports HDR output
+    bool latency_mode_applied = false; // bbport: VK_NV_low_latency2 mode on the live handle
 };
 
 } // namespace Vulkan

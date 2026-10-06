@@ -3,9 +3,9 @@
 
 #pragma once
 
-#include <deque>
-
+#include <atomic>
 #include <condition_variable>
+#include <deque>
 
 #include "core/libraries/videoout/buffer.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
@@ -37,6 +37,7 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
+    u64 present_id{0}; // bbport: VK_NV_low_latency2 marker id of the presentation cycle
 
 };
 
@@ -108,6 +109,12 @@ private:
 
     void SetExpectedGameSize(s32 width, s32 height);
 
+    /// bbport: VK_NV_low_latency2 pacing is live (extension, setting on, no fault).
+    bool LowLatency() const;
+    /// bbport: tags the frame's latency window (SIMULATION_* on the GPU command thread,
+    /// PRESENT_* on the present thread; the driver assembles the per-frame report).
+    void LatencyMarker(Frame* frame, vk::LatencyMarkerNV marker);
+
 private:
     float expected_ratio{1920.0 / 1080.0f};
     u32 expected_frame_width{1920};
@@ -136,6 +143,16 @@ private:
     std::condition_variable free_cv;
     std::condition_variable_any frame_cv;
     std::vector<VAddr> vo_buffers_addr;
+
+    // bbport: VK_NV_low_latency2 state. One timeline semaphore carries the driver's sleep
+    // signals from the present thread (arm after present) to the GPU command thread (wait
+    // at frame start).
+    vk::UniqueSemaphore latency_semaphore;
+    std::atomic<u64> latency_sleep_value{0};
+    std::atomic<bool> latency_sleep_armed{false};
+    std::atomic<bool> latency_broken{false}; ///< a sleep never signalled: pause the feature
+    std::atomic<bool> latency_mode_on{false}; ///< presenter mirror of the user toggle
+    std::atomic<u64> present_id_counter{0};
 };
 
 } // namespace Vulkan

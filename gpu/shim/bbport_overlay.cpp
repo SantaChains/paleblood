@@ -75,6 +75,8 @@ float base_scale = 1.0f;
 std::chrono::steady_clock::time_point last_present{};
 float frame_ms_avg = 0.0f;
 float frame_ms_max = 0.0f; // recent worst frame, decays so spikes age out
+// Driver-measured frame latency (VK_NV_low_latency2); negative while unavailable.
+std::atomic<float> latency_ms{-1.0f};
 
 const char* UpscalerLabel(int upscaler) {
     switch (upscaler) {
@@ -492,6 +494,9 @@ void DisplayPage() {
         Store(s.fps_detail, d, changed);
     }
     Hint("立即生效。毫秒是平滑后的平均帧时间，最差是近期最慢的一帧，随时间缓慢回落。");
+    Checkbox("低延迟模式（Reflex）", s.low_latency);
+    Hint("NVIDIA RTX 专属：驱动把渲染队列压到 present 之前、并按节拍放行下一帧，输入到画面的"
+         "延迟可降低约一半；开启后 FPS 读数附带驱动测量的帧延迟。立即生效。");
     RestartNotice();
 }
 
@@ -701,11 +706,24 @@ void FpsCounter() {
     const auto& s = BbSettings::Get();
     const char* mode = UpscalerLabel(s.upscaler);
     const int detail = s.fps_detail.load();
+    // Driver-measured latency (low latency mode on); gate on the mode so the last reading
+    // never lingers after a toggle-off or a driver failure.
+    const float lat = s.low_latency.load() ? latency_ms.load() : -1.0f;
     if (detail == 0) {
         ImGui::Text("%.0f FPS  %s", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f, mode);
     } else if (detail == 1) {
-        ImGui::Text("%.0f FPS  %.1f ms  %s",
-                    frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f, frame_ms_avg, mode);
+        if (lat >= 0.0f) {
+            ImGui::Text("%.0f FPS  %.1f ms  延迟 %.1f ms  %s",
+                        frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f, frame_ms_avg, lat,
+                        mode);
+        } else {
+            ImGui::Text("%.0f FPS  %.1f ms  %s",
+                        frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f, frame_ms_avg, mode);
+        }
+    } else if (lat >= 0.0f) {
+        ImGui::Text("%.0f FPS  %.1f ms  worst %.1f ms  延迟 %.1f ms  %s",
+                    frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f, frame_ms_avg, frame_ms_max,
+                    lat, mode);
     } else {
         ImGui::Text("%.0f FPS  %.1f ms  worst %.1f ms  %s",
                     frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f, frame_ms_avg, frame_ms_max,
@@ -715,6 +733,10 @@ void FpsCounter() {
 }
 
 } // namespace
+
+void SetLatencyMs(float ms) {
+    latency_ms = ms;
+}
 
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
     std::scoped_lock lock{imgui_mutex};

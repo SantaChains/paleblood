@@ -68,6 +68,8 @@ void main() {
     uint rng = uint(p.x) * 1973u ^ uint(p.y) * 9277u ^ seed;
     pcg(rng);
     pcg(rng);
-    const float dither = (rnd(rng) + rnd(rng) - 1.0) / 255.0;
+    // Output dither at 1 LSB peak-to-peak (libplacebo's output convention): just enough to
+    // decorrelate the 8-bit rounding without lifting the noise floor in dark scenes.
+    const float dither = (rnd(rng) + rnd(rng) - 1.0) / 510.0;
     imageStore(dst_img, p, vec4(clamp(sharpened + dither, vec3(0.0), vec3(1.0)), 1.0));
 }

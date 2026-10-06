@@ -76,6 +76,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.show_fps = i != 0;
     } else if (key == "fps_detail") {
         v.fps_detail = std::clamp(i, 0, 2);
+    } else if (key == "low_latency") {
+        v.low_latency = i != 0;
     } else if (key == "fsr4_auto_exposure") {
         v.fsr4_auto_exposure = i != 0;
     } else if (key == "fsr4_invert_jitter") {
@@ -170,6 +172,7 @@ void Load() {
         {"BB_REACTIVE", "reactive"},              {"BB_REACTIVE_SCALE", "reactive_scale"},
         {"BB_REACTIVE_THRESHOLD", "reactive_threshold"}, {"BB_REACTIVE_MAX", "reactive_max"},
         {"BB_UPSCALE_PRESET", "preset"},            {"BB_OBJECT_MOTION", "object_motion"},
+        {"BB_LOW_LATENCY", "low_latency"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env)) {
@@ -242,6 +245,7 @@ void Save() {
         "fps_detail",
         "fsr4_auto_exposure", "fsr4_invert_jitter", "model_lod",      "output_res",
         "display_mode",       "hide_cursor",        "display",        "ui_scale",
+        "low_latency",
         "live_resolution",    "post_deband",        "post_shadow",    "post_sharpen",
         "post_defog",         "post_contrast",      "post_saturation",
         "post_range",         "post_split",
@@ -298,6 +302,7 @@ void Save() {
     std::fprintf(file, "display_mode=%d\nhide_cursor=%d\ndisplay=%d\nui_scale=%d\n",
                  v.display_mode.load(), v.hide_cursor.load(), v.display.load(),
                  v.ui_scale.load());
+    std::fprintf(file, "low_latency=%d\n", int(v.low_latency.load()));
     std::fprintf(file, "post_deband=%d\npost_shadow=%d\npost_sharpen=%d\n", v.post_deband.load(),
                  v.post_shadow.load(), v.post_sharpen.load());
     std::fprintf(file, "post_defog=%d\npost_contrast=%d\npost_saturation=%d\n", v.post_defog.load(),

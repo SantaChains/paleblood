@@ -83,8 +83,9 @@ void main() {
     // Contrast around mid-grey, then saturation away from Rec.709 luma.
     outc = (outc - 0.5) * contrast + 0.5;
     outc = mix(vec3(dot(outc, vec3(0.2126, 0.7152, 0.0722))), outc, saturation);
-    // Triangular dither at HALF amplitude (+-0.5 level): pass 2 adds its own full +-1 level
-    // dither, and the stacked noise must stay under ~1.5 LSB (libplacebo's ceiling).
+    // Triangular dither at 1 LSB peak-to-peak: the mid image is 8-bit, and without this the
+    // merged values re-quantize into bands for RCAS to amplify; pass 2 adds the same
+    // amplitude, keeping the stacked noise at libplacebo's output scale.
     const float dither = (rnd(rng) + rnd(rng) - 1.0) / 510.0;
     imageStore(dst_img, p, vec4(clamp(outc + dither, vec3(0.0), vec3(1.0)), 1.0));
 }

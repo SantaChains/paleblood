@@ -51,7 +51,12 @@ void Swapchain::Create(u32 width_, u32 height_) {
     const vk::SharingMode sharing_mode =
         exclusive ? vk::SharingMode::eExclusive : vk::SharingMode::eConcurrent;
     const auto format = needs_hdr ? SURFACE_FORMAT_HDR : surface_format;
+    // bbport: unlock VK_NV_low_latency2 for this swapchain; the mode itself is applied per
+    // frame through ApplyLatencyMode and re-armed after every recreation.
+    vk::SwapchainLatencyCreateInfoNV latency_info{};
+    latency_info.latencyModeEnable = instance.IsLowLatencyCapable() ? VK_TRUE : VK_FALSE;
     const vk::SwapchainCreateInfoKHR swapchain_info = {
+        .pNext = instance.IsLowLatencyCapable() ? &latency_info : nullptr,
         .surface = surface,
         .minImageCount = image_count,
         .imageFormat = format.format,
@@ -77,6 +82,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
 
     SetupImages();
     RefreshSemaphores();
+    latency_mode_applied = false;
 }
 
 void Swapchain::Recreate(u32 width_, u32 height_) {
@@ -147,6 +153,24 @@ bool Swapchain::Present() {
     frame_index = (frame_index + 1) % image_count;
 
     return !needs_recreation;
+}
+
+void Swapchain::ApplyLatencyMode(bool low_latency_mode) {
+    if (!instance.IsLowLatencyCapable() || latency_mode_applied == low_latency_mode) {
+        return;
+    }
+    // Only the queue-emptying low latency mode: minimumIntervalUs 0 (no synthetic frame cap)
+    // and boost off; the sleep call paces frame starts.
+    const vk::LatencySleepModeInfoNV sleep_mode = {
+        .lowLatencyMode = low_latency_mode ? VK_TRUE : VK_FALSE,
+    };
+    const vk::Result result = instance.GetDevice().setLatencySleepModeNV(swapchain, sleep_mode);
+    if (result != vk::Result::eSuccess) {
+        LOG_WARNING(Render_Vulkan, "vkSetLatencySleepModeNV failed: {}", vk::to_string(result));
+        return;
+    }
+    latency_mode_applied = low_latency_mode;
+    LOG_INFO(Render_Vulkan, "Low latency mode {}", low_latency_mode ? "on" : "off");
 }
 
 void Swapchain::FindPresentFormat() {
