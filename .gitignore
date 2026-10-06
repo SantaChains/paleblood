@@ -27,6 +27,8 @@ patches.json
 
 /BB_Launcher
 .history/
-shadPS4/
-patches/
+/shadPS4/
+/fonts/
+/run.txt
+/cheats/state.txt
 steam_appid.txt

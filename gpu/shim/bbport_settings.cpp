@@ -223,8 +223,8 @@ void Save() {
         "fsr4_auto_exposure", "fsr4_invert_jitter", "model_lod",      "output_res",
         "display_mode",       "hide_cursor",        "display",        "ui_scale",
         "live_resolution",    "post_deband",        "post_shadow",    "post_sharpen",
-        "post_defog",         "post_contrast",      "post_saturation", "post_range",
-        "post_split",
+        "post_defog",         "post_contrast",      "post_saturation",
+        "post_range",         "post_split",
         "dlss_preset",
         "fullscreen", // legacy: absorbed so old lines are not kept as foreign
     };

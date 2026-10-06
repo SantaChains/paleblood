@@ -93,13 +93,13 @@ struct Values {
     std::atomic<int> ui_scale{100};
     /// Present-path post chain (BbPost), hot-applied every frame. Each percent strength turns
     /// its effect off at 0, and the whole chain is bypassed when everything is 0.
-    std::atomic<int> post_deband{50}; ///< f3kdb-style banding threshold strength, percent
-    std::atomic<int> post_shadow{0};  ///< black-level lift, percent (100% = black at 0.30)
-    std::atomic<int> post_sharpen{0}; ///< RCAS strength after upscaling, percent
-    std::atomic<int> post_defog{0};   ///< uniform haze removal (black-point pull), percent
+    std::atomic<int> post_deband{50};    ///< f3kdb-style banding threshold strength, percent
+    std::atomic<int> post_shadow{0};     ///< black-level lift, percent (100% = black at 0.30)
+    std::atomic<int> post_sharpen{0};    ///< RCAS strength after upscaling, percent
+    std::atomic<int> post_defog{0};      ///< uniform haze removal (black-point pull), percent
     std::atomic<int> post_contrast{0};   ///< contrast around mid-grey, percent (100% = x1.30)
     std::atomic<int> post_saturation{0}; ///< saturation over Rec.709 luma, percent (100% = x1.40)
-    std::atomic<int> post_range{12};  ///< deband sample radius, pixels 4..32
+    std::atomic<int> post_range{12};     ///< deband sample radius, pixels 4..32
     std::atomic<bool> post_split{false}; ///< debug: left half of pass 1 stays untouched
     /// NGX DLSS model preset override: -1 driver default, 0 default, 10..13 = J..M.
     std::atomic<int> dlss_preset{-1};
