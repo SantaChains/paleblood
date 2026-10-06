@@ -2,6 +2,8 @@
 #include "bbport_settings.h"
 
 #include <algorithm>
+#include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,9 +25,27 @@ float Clamp(float v, float lo, float hi) {
     return std::clamp(v, lo, hi);
 }
 
+/// atoi/atof are undefined on overflow and happily parse inf/nan — a hand-edited ini can
+/// carry anything, so parse strictly: strtoll saturates into the int range, floats must be
+/// finite or the key falls back to 0.
+int ParseInt(const std::string& value) {
+    char* end = nullptr;
+    const long long parsed = std::strtoll(value.c_str(), &end, 10);
+    if (end == value.c_str()) {
+        return 0;
+    }
+    return int(std::clamp(parsed, 1LL * INT_MIN, 1LL * INT_MAX));
+}
+
+float ParseFloat(const std::string& value) {
+    char* end = nullptr;
+    const float parsed = std::strtof(value.c_str(), &end);
+    return end == value.c_str() || !std::isfinite(parsed) ? 0.0f : parsed;
+}
+
 void Set(Values& v, const std::string& key, const std::string& value) {
-    const float f = float(std::atof(value.c_str()));
-    const int i = std::atoi(value.c_str());
+    const float f = ParseFloat(value);
+    const int i = ParseInt(value);
     if (key == "upscaler") {
         for (int u = 0; u < UpscalerCount; ++u) {
             if (value == UpscalerName(u)) {
@@ -280,8 +300,10 @@ void Save() {
                  v.ui_scale.load());
     std::fprintf(file, "post_deband=%d\npost_shadow=%d\npost_sharpen=%d\n", v.post_deband.load(),
                  v.post_shadow.load(), v.post_sharpen.load());
-    std::fprintf(file, "post_defog=%d\npost_range=%d\npost_split=%d\n", v.post_defog.load(),
-                 v.post_range.load(), v.post_split.load() ? 1 : 0);
+    std::fprintf(file, "post_defog=%d\npost_contrast=%d\npost_saturation=%d\n", v.post_defog.load(),
+                 v.post_contrast.load(), v.post_saturation.load());
+    std::fprintf(file, "post_range=%d\npost_split=%d\n", v.post_range.load(),
+                 v.post_split.load() ? 1 : 0);
     std::fprintf(file, "dlss_preset=%d\n", v.dlss_preset.load());
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"

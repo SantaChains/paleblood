@@ -1067,8 +1067,9 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 }
 
 /// bbport: synchronous write-backs (tiling compute plus copy) allowed per GC pass under mere
-/// memory pressure. Spreading them over submits keeps one frame from absorbing a burst; at the
-/// critical mark the cap is lifted, memory safety wins over smoothness. 0 disables the cap.
+/// memory pressure. The base cap spreads the cost over submits; the effective cap scales up to
+/// 4x as usage approaches the critical mark, keeping the steady-state usage low (a driver reset
+/// under churn costs more than a hitch). 0 disables the cap entirely.
 static size_t GcDownloadsPerPass() {
     static const size_t cap = [] {
         const char* env = std::getenv("BB_GC_DOWNLOADS_PER_PASS");
@@ -1076,6 +1077,15 @@ static size_t GcDownloadsPerPass() {
         return v == 0 ? SIZE_MAX : size_t(v);
     }();
     return cap;
+}
+
+static size_t ScaledDownloadBudget(u64 used, u64 pressure, u64 critical) {
+    const size_t base = GcDownloadsPerPass();
+    if (base == SIZE_MAX || critical <= pressure) {
+        return SIZE_MAX;
+    }
+    const float t = used > pressure ? std::min(float(used - pressure) / float(critical - pressure), 1.0f) : 0.0f;
+    return base + size_t(3.0f * base * t);
 }
 
 void TextureCache::GarbageCollectImages() {
@@ -1124,7 +1134,10 @@ void TextureCache::GarbageCollectImages() {
         ticks_to_destroy = aggresive ? 16 : pressured ? 80 : 16;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
-        download_budget = pressured && !aggresive ? GcDownloadsPerPass() : SIZE_MAX;
+        download_budget = pressured && !aggresive
+                              ? ScaledDownloadBudget(total_used_memory, pressure_gc_memory,
+                                                     critical_gc_memory)
+                              : SIZE_MAX;
     };
     const auto clean_up = [&](ImageId image_id) {
         if (num_deletions == 0) {
@@ -1180,13 +1193,15 @@ void TextureCache::GarbageCollectImages() {
     // re-touches its whole streamed working set every frame, so both age windows above
     // can legitimately come up empty while usage keeps climbing until the driver resets
     // the device on submit (device lost). Evict the least recently used images regardless
-    // of age; GPU-written ones are written back first, tiled ones through the
-    // tiling compute.
+    // of age — but never younger than 16 ticks: images bound by the just-submitted command
+    // buffer are still in flight, and freeing them there is use-after-free (device-lost
+    // class). GPU-written victims are written back first, tiled ones via the tiling compute.
     if (total_used_memory >= critical_gc_memory) {
         pressured = true;
         num_deletions = 64;
         download_budget = SIZE_MAX;
-        lru_cache.ForEachItemBelow(gc_tick + 1, clean_up);
+        ticks_to_destroy = 16;
+        lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
     // bbport: evictions under memory pressure, at most every 5 s (BB_FRAME_STATS or not).
     if (pressured || gc_downloads != 0) {

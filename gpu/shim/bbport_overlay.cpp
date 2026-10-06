@@ -488,7 +488,8 @@ void DisplayPage() {
     {
         static const char* details[] = {"帧率", "帧率 + 毫秒", "帧率 + 毫秒 + 最差"};
         int d = s.fps_detail;
-        Store(s.fps_detail, d, ImGui::Combo("FPS 显示内容", &d, details, 3));
+        const bool changed = ImGui::Combo("FPS 显示内容", &d, details, 3);
+        Store(s.fps_detail, d, changed);
     }
     Hint("立即生效。毫秒是平滑后的平均帧时间，最差是近期最慢的一帧，随时间缓慢回落。");
     RestartNotice();
@@ -513,42 +514,51 @@ void EffectsPage() {
     if (ImGui::CollapsingHeader("后处理（去色带 / 去雾 / 暗部 / 对比 / 饱和 / 锐化）")) {
         {
             int v = s.post_deband;
-            Hint("去色带：天空、雾与暗部的 8-bit 分层感。f3kdb / mpv 同思路，50% 约为 "
-                 "libplacebo 默认阈值。全部参数立即生效。");
-            Store(s.post_deband, v, ImGui::SliderInt("去色带强度", &v, 0, 100, "%d%%"));
+            Hint("去色带：天空、雾与暗部的 8-bit 分层感。mpv/libplacebo 同款算法，0 关闭，"
+                 "低档最接近 mpv 默认。全部参数立即生效。");
+            const bool changed = ImGui::SliderInt("去色带强度", &v, 0, 100, "%d%%");
+            Store(s.post_deband, v, changed);
         }
         {
             int v = s.post_range;
-            Hint("去色带采样半径。大半径平滑更长渐变，小半径更保守、不易碰到细线。");
-            Store(s.post_range, v, ImGui::SliderInt("去色带半径（像素）", &v, 4, 32));
+            Hint("去色带采样半径。链在放大之后运行，条带被拉宽：约 2 倍放大建议 16-24；"
+                 "大半径平滑更长渐变，小半径更保守。");
+            const bool changed = ImGui::SliderInt("去色带半径（像素）", &v, 4, 32);
+            Store(s.post_range, v, changed);
         }
         {
             int v = s.post_defog;
             Hint("去雾：减去一层均匀灰雾（100% 相当于 1/4 白的黑位下拉）。对实机远景的"
                  "灰蒙感有效；游戏内的体积浓雾是美术设计，过度去雾会伤氛围。");
-            Store(s.post_defog, v, ImGui::SliderInt("去雾强度", &v, 0, 100, "%d%%"));
+            const bool changed = ImGui::SliderInt("去雾强度", &v, 0, 100, "%d%%");
+            Store(s.post_defog, v, changed);
         }
         {
             int v = s.post_shadow;
-            Hint("暗部提升：把黑位抬起一条 gamma 式曲线（100% 时纯黑变为约 30% 灰）。");
-            Store(s.post_shadow, v, ImGui::SliderInt("暗部提升", &v, 0, 100, "%d%%"));
+            Hint("暗部提升：近黑区域按乘法曲线提亮（100% 时最亮约 1.3 倍），黑点保持纯黑，"
+                 "不雾化黑位。");
+            const bool changed = ImGui::SliderInt("暗部提升", &v, 0, 100, "%d%%");
+            Store(s.post_shadow, v, changed);
         }
         {
             int v = s.post_contrast;
-            Hint("对比度：绕中间灰拉伸明暗（100% 约为 1.3 倍），中间灰不动，0 不生效。"
-                 "先抬黑再拉伸，与暗部提升叠加时黑位会同步变深。");
-            Store(s.post_contrast, v, ImGui::SliderInt("对比度", &v, 0, 100, "%d%%"));
+            Hint("对比度：绕中间灰拉伸明暗（100% 约为 1.3 倍），中间灰与黑点均不动，"
+                 "0 不生效。先去雾再拉伸。");
+            const bool changed = ImGui::SliderInt("对比度", &v, 0, 100, "%d%%");
+            Store(s.post_contrast, v, changed);
         }
         {
             int v = s.post_saturation;
             Hint("饱和度：离开 Rec.709 亮度轴拉高彩度（100% 约为 1.4 倍），0 不生效。"
                  "游戏本身偏浓艳，建议从 10 到 30 起步。");
-            Store(s.post_saturation, v, ImGui::SliderInt("饱和度", &v, 0, 100, "%d%%"));
+            const bool changed = ImGui::SliderInt("饱和度", &v, 0, 100, "%d%%");
+            Store(s.post_saturation, v, changed);
         }
         {
             int v = s.post_sharpen;
             Hint("锐化：AMD RCAS（FSR 附带的锐化内核），与画面页超分自带的锐化独立，通常二选一。");
-            Store(s.post_sharpen, v, ImGui::SliderInt("锐化强度", &v, 0, 100, "%d%%"));
+            const bool changed = ImGui::SliderInt("锐化强度", &v, 0, 100, "%d%%");
+            Store(s.post_sharpen, v, changed);
         }
         Checkbox("分割对比（左半原帧）", s.post_split);
         Hint("排查用：左半屏保留未处理的原始画面，右半屏走后处理链，用于逐项核对"

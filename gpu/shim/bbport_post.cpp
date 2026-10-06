@@ -31,10 +31,11 @@ struct SharpenPush {
     float size[2];
     float amount;
     u32 seed;
+    u32 split;
 };
-static_assert(sizeof(SharpenPush) == 16);
+static_assert(sizeof(SharpenPush) == 20);
 
-// Black lift at 100%: black becomes 0.30 grey, the middle range barely moves.
+// Shadow toe at 100%: near-black brightens by up to 1.3x, black stays black.
 constexpr float LiftScale = 0.30f;
 // Fog removal at 100%: subtract an even haze of 0.25 (a quarter of full white).
 constexpr float DefogScale = 0.25f;
@@ -49,6 +50,10 @@ VmaAllocation mid_alloc{}, out_alloc{};
 vk::ImageView mid_view{}, out_view{};
 u32 width = 0, height = 0;
 bool mid_defined = false, out_defined = false;
+// Layout tracking for the two work images: GENERAL while compute owns them, each ends the
+// frame in eTransferSrcOptimal when it was the blit source and comes back on the next entry.
+vk::ImageLayout mid_layout = vk::ImageLayout::eGeneral;
+vk::ImageLayout out_layout = vk::ImageLayout::eGeneral;
 bool failed = false;
 u32 frame_seed = 0;
 vk::Image output{};
@@ -61,9 +66,11 @@ vk::Device Device() {
     return instance->GetDevice();
 }
 
-/// 1..100 percent onto 1..7 8-bit levels: 50% is libplacebo's 4/255 default threshold.
+/// 0 = no merging (the slider's zero), else 1..100 percent onto 1..7 8-bit levels. mpv
+/// debands at 0.75/255 by default and libplacebo at 3/255, so the low end of the slider is
+/// the sane zone; 50% (4/255) is already aggressive.
 float DebandThreshold(int percent) {
-    return (1.0f + float(percent) * 0.06f) / 255.0f;
+    return percent > 0 ? (1.0f + float(percent) * 0.06f) / 255.0f : 0.0f;
 }
 
 void DestroyImages() {
@@ -127,6 +134,7 @@ bool CreateImages(u32 w, u32 h) {
     }
     width = w;
     height = h;
+    mid_layout = out_layout = vk::ImageLayout::eGeneral;
     return true;
 }
 
@@ -194,12 +202,14 @@ void Dispatch(vk::CommandBuffer cmdbuf, vk::Pipeline pipeline, vk::ImageView src
     cmdbuf.dispatch((width + 7) / 8, (height + 7) / 8, 1);
 }
 
-/// Reads-before-writes across the frame boundary for one work image (kept in eGeneral).
-vk::ImageMemoryBarrier MakeEntryBarrier(vk::Image image, bool defined) {
+/// Reads-before-writes across the frame boundary for one work image. The source side must
+/// cover BOTH the previous frame's shader writes (availability) and its blit reads (the
+/// finished transfers must be ordered before this frame's writes): eMemoryRead|eMemoryWrite.
+vk::ImageMemoryBarrier MakeEntryBarrier(vk::Image image, bool defined, vk::ImageLayout current) {
     return vk::ImageMemoryBarrier{
-        .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+        .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
         .dstAccessMask = vk::AccessFlagBits::eShaderWrite,
-        .oldLayout = defined ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined,
+        .oldLayout = defined ? current : vk::ImageLayout::eUndefined,
         .newLayout = vk::ImageLayout::eGeneral,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -268,16 +278,22 @@ void Record(vk::CommandBuffer cmdbuf, vk::ImageView src_view, u32 w, u32 h) {
     std::array<vk::ImageMemoryBarrier, 2> entries{};
     u32 entry_count = 0;
     if (pass1_on) {
-        entries[entry_count++] = MakeEntryBarrier(mid_image, mid_defined);
+        entries[entry_count++] = MakeEntryBarrier(mid_image, mid_defined, mid_layout);
     }
     if (sharpen_on) {
-        entries[entry_count++] = MakeEntryBarrier(out_image, out_defined);
+        entries[entry_count++] = MakeEntryBarrier(out_image, out_defined, out_layout);
     }
     if (entry_count > 0) {
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
                                vk::PipelineStageFlagBits::eComputeShader,
                                vk::DependencyFlagBits::eByRegion, {}, {},
                                vk::ArrayProxy<vk::ImageMemoryBarrier>(entry_count, entries.data()));
+        if (pass1_on) {
+            mid_layout = vk::ImageLayout::eGeneral;
+        }
+        if (sharpen_on) {
+            out_layout = vk::ImageLayout::eGeneral;
+        }
     }
     mid_defined = pass1_on;
     out_defined = sharpen_on;
@@ -303,20 +319,43 @@ void Record(vk::CommandBuffer cmdbuf, vk::ImageView src_view, u32 w, u32 h) {
         output = mid_image;
     }
     if (sharpen_on) {
-        const SharpenPush push{{float(w), float(h)}, float(s.post_sharpen.load()) / 100.0f, seed};
+        const SharpenPush push{{float(w), float(h)}, float(s.post_sharpen.load()) / 100.0f, seed,
+                               s.post_split.load() ? 1u : 0u};
         Dispatch(cmdbuf, *sharpen_pipeline, last_view, out_view, &push, sizeof(push));
         output = out_image;
     }
-    // The presenter blits the result into the swapchain right after this.
-    const vk::MemoryBarrier write_done{.srcAccessMask = vk::AccessFlagBits::eShaderWrite,
-                                       .dstAccessMask = vk::AccessFlagBits::eTransferRead};
-    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
-                           write_done, {}, {});
+    // The presenter blits the result into the swapchain right after this. Leave the blit
+    // source in the optimal transfer layout instead of eGeneral: legal either way, but the
+    // optimal path is the one drivers actually exercise. The image barrier alone carries the
+    // shader-write -> transfer-read ordering for the source image.
+    if (pass1_on || sharpen_on) {
+        vk::Image& blit_image = sharpen_on ? out_image : mid_image;
+        vk::ImageLayout& blit_layout = sharpen_on ? out_layout : mid_layout;
+        const vk::ImageMemoryBarrier blit_ready{
+            .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+            .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = blit_image,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        };
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                               vk::PipelineStageFlagBits::eTransfer,
+                               vk::DependencyFlagBits::eByRegion, {}, {}, blit_ready);
+        blit_layout = vk::ImageLayout::eTransferSrcOptimal;
+    }
 }
 
 vk::Image OutputImage() {
     return output;
+}
+
+/// The blit-source layout Record leaves the output in (mid when only pass 1 runs, out when
+/// pass 2 ran; unchanged when a settings race skipped both passes this frame).
+vk::ImageLayout OutputLayout() {
+    return vk::ImageLayout::eTransferSrcOptimal;
 }
 
 } // namespace BbPost

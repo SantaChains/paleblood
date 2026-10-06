@@ -27,9 +27,11 @@ void Shutdown();
 bool Prepare(u32 width, u32 height, vk::Format surface_format);
 
 /// Present thread, after the game frame is available for shader reads: records the passes.
-/// Ends with the output image in eGeneral, ready as a blit source.
+/// Ends with the output image in eTransferSrcOptimal, ready as a blit source.
 void Record(vk::CommandBuffer cmdbuf, vk::ImageView src_view, u32 width, u32 height);
 /// The image Record left the final pixels in (mid when only deband runs, out otherwise).
 vk::Image OutputImage();
+/// The layout OutputImage is in when Record returns: eTransferSrcOptimal for the blit.
+vk::ImageLayout OutputLayout();
 
 } // namespace BbPost

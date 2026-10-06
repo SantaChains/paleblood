@@ -61,20 +61,21 @@ static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_in
             src_layers = dst_layers = std::min(src_layers, dst_layers);
         }
     } else {
-        // For 2D <-> 3D copies, 2D layer count must equal 3D depth.
+        // For 2D <-> 3D copies, 2D layer count must equal 3D depth. Clamp instead of forcing:
+        // a count past what the 2D side actually has is invalid usage (layer range out of
+        // bounds), and the game may legitimately copy fewer slices than the full depth.
         if (vk_src_type == vk::ImageType::e2D && vk_dst_type == vk::ImageType::e3D &&
             src_layers != depth) {
-            LOG_WARNING(Render_Vulkan,
-                        "Coercing copy 2D source layers {} to 3D destination depth {}", src_layers,
-                        depth);
-            src_layers = depth;
+            LOG_WARNING(Render_Vulkan, "Clamping copy 2D source layers {} to 3D destination depth {}",
+                        src_layers, depth);
+            src_layers = std::min(src_layers, depth);
         }
         if (vk_src_type == vk::ImageType::e3D && vk_dst_type == vk::ImageType::e2D &&
             dst_layers != depth) {
             LOG_WARNING(Render_Vulkan,
-                        "Coercing copy 2D destination layers {} to 3D source depth {}", dst_layers,
+                        "Clamping copy 2D destination layers {} to 3D source depth {}", dst_layers,
                         depth);
-            dst_layers = depth;
+            dst_layers = std::min(dst_layers, depth);
         }
     }
 

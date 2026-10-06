@@ -625,7 +625,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                                vk::DependencyFlagBits::eByRegion, clear_done, {}, {});
         if (use_post) {
             BbPost::Record(cmdbuf, frame->image_view, u32(frame->width), u32(frame->height));
-            cmdbuf.blitImage(BbPost::OutputImage(), vk::ImageLayout::eGeneral, swapchain_image,
+            cmdbuf.blitImage(BbPost::OutputImage(), BbPost::OutputLayout(), swapchain_image,
                              vk::ImageLayout::eTransferDstOptimal,
                              MakeImageBlitFit(frame->width, frame->height, extent.width,
                                               extent.height),
