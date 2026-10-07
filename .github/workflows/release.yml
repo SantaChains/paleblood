@@ -78,7 +78,11 @@ jobs:
             pkgconf
             mingw-w64-clang-x86_64-boost
             mingw-w64-clang-x86_64-vulkan-headers
+            mingw-w64-clang-x86_64-vulkan-loader
             mingw-w64-clang-x86_64-vulkan-memory-allocator
+            mingw-w64-clang-x86_64-fmt
+            mingw-w64-clang-x86_64-robin-map
+            mingw-w64-clang-x86_64-zydis
             mingw-w64-clang-x86_64-glslang
             mingw-w64-clang-x86_64-sdl3
 
