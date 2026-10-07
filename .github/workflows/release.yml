@@ -86,6 +86,8 @@ jobs:
             mingw-w64-clang-x86_64-fmt
             mingw-w64-clang-x86_64-robin-map
             mingw-w64-clang-x86_64-zydis
+            mingw-w64-clang-x86_64-xxhash
+            mingw-w64-clang-x86_64-ffmpeg
             mingw-w64-clang-x86_64-glslang
             mingw-w64-clang-x86_64-sdl3
 

@@ -40,6 +40,10 @@ elseif (BB_PGO STREQUAL "use")
                         -fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch)
 endif()
 
+# MSYS2's clang64 import library is libvulkan-1.dll.a, a name CMake's FindVulkan NAMES
+# list misses; pre-locate it here so the REQUIRED find_package below picks up the cached
+# value. Harmless elsewhere: the names it adds are ordinary Vulkan loader spellings.
+find_library(Vulkan_LIBRARY NAMES Vulkan vulkan-1 vulkan HINTS "$ENV{VULKAN_SDK}/lib" "$ENV{VULKAN_SDK}/bin")
 find_package(Vulkan REQUIRED)
 find_package(fmt REQUIRED)
 find_package(Boost REQUIRED)
