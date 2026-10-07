@@ -179,6 +179,13 @@ public:
         return vertex_input_dynamic_state;
     }
 
+    /// Returns true when VK_EXT_graphics_pipeline_library is supported: graphics pipelines are
+    /// built as a pre-rasterization and a fragment-output library and then linked, letting the
+    /// driver reuse compiled subsets across pipeline variants at first draw.
+    bool IsGraphicsPipelineLibraryEnabled() const {
+        return graphics_pipeline_library;
+    }
+
     /// Returns true when VK_KHR_fragment_shader_barycentric is supported.
     bool IsFragmentShaderBarycentricSupported() const {
         return fragment_shader_barycentric;
@@ -555,6 +562,7 @@ private:
     bool dynamic_state_3{};
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};
+    bool graphics_pipeline_library{};
     bool list_restart{};
     bool provoking_vertex{};
     bool shader_stencil_export{};

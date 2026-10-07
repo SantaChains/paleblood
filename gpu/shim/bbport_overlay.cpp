@@ -10,6 +10,7 @@
 #include <mutex>
 
 #include <SDL3/SDL.h>
+#include "bbport_menu_blur.h"
 #include "bbport_settings.h"
 #include "imgui.h"
 #include "imgui_internal.h" // ImGuiContext::ErrorCallback
@@ -72,6 +73,12 @@ std::atomic<bool> menu_open{false};
 bool l3_down = false, r3_down = false;
 bool dirty = false; // settings changed while open: saved on close
 float base_scale = 1.0f;
+float menu_anim = 0.0f; // open ramp 0..1 (the close stays instant)
+
+/// Smoothstep of the open ramp, shared by the window slide and the backdrop fade.
+float MenuEase() {
+    return menu_anim * menu_anim * (3.0f - 2.0f * menu_anim);
+}
 
 // The Vulkan backend: kept so a swapchain format change (HDR toggle) can rebuild it.
 ImGui_ImplVulkan_InitInfo backend_info{};
@@ -101,6 +108,9 @@ const char* UpscalerLabel(int upscaler) {
 void SetOpen(bool value) {
     if (menu_open.exchange(value) == value) {
         return;
+    }
+    if (value) {
+        menu_anim = 0.0f; // replay the open ramp on every open
     }
     ImGui::GetIO().MouseDrawCursor = value;
     if (!value) {
@@ -783,8 +793,8 @@ void AdvancedPage() {
         Hint("显存用量越过预算 70% 开始回收，85% 加压、95% 激进；写回指 GPU 改过的纹理在"
              "逐出前落回 CPU 内存。计数自上次压力报告起累计，约 5 秒一轮。");
     }
-}
-
+}
+
 void CheatsPage() {
     static const char* cheat_error = nullptr;
     if (const int cheat_files = bbcheats_file_count()) {
@@ -840,9 +850,16 @@ void CheatsPage() {
 void Menu() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const ImVec2 work = viewport->WorkSize;
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + 40.0f * base_scale,
-                                   viewport->WorkPos.y + 40.0f * base_scale),
-                            ImGuiCond_Appearing);
+    const ImVec2 base(viewport->WorkPos.x + 40.0f * base_scale,
+                      viewport->WorkPos.y + 40.0f * base_scale);
+    if (menu_anim < 1.0f) {
+        // Open ramp: the window slides up into place (the close stays instant).
+        const float e = MenuEase();
+        ImGui::SetNextWindowPos(ImVec2(base.x, base.y + (1.0f - e) * 24.0f * base_scale),
+                                ImGuiCond_Always);
+    } else {
+        ImGui::SetNextWindowPos(base, ImGuiCond_Appearing);
+    }
     const float width = std::min(700.0f * base_scale, work.x - 60.0f * base_scale);
     const float height = std::min(540.0f * base_scale, work.y - 60.0f * base_scale);
     ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Appearing);
@@ -901,6 +918,23 @@ void Menu() {
     if (!keep_open) {
         SetOpen(false);
     }
+}
+
+/// Frosted-glass backdrop: the blurred frame across the whole display plus a slight dim,
+/// both fading in with the menu ramp. Runs inside the locked frame, so the lazy texture
+/// creation in BbMenuBlur::Texture is safe here.
+void DrawBackdrop() {
+    const ImTextureID bg = BbMenuBlur::Texture();
+    if (!bg) {
+        return;
+    }
+    const float e = MenuEase();
+    const ImVec2 size = ImGui::GetIO().DisplaySize;
+    ImDrawList* const dl = ImGui::GetBackgroundDrawList();
+    dl->AddImageRounded(bg, ImVec2(0.0f, 0.0f), size, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f),
+                        ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 1.0f, 1.0f, 0.90f * e)), 0.0f);
+    dl->AddRectFilled(ImVec2(0.0f, 0.0f), size,
+                      ImGui::ColorConvertFloat4ToU32(ImVec4(0.0f, 0.0f, 0.0f, 0.28f * e)));
 }
 
 void FpsCounter() {
@@ -974,10 +1008,37 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
 
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 6.0f;
-    style.FrameRounding = 4.0f;
-    style.GrabRounding = 4.0f;
-    style.Colors[ImGuiCol_WindowBg].w = 0.92f;
+    // Glass-adjacent look: rounder corners, breathing room, a quiet amber accent.
+    style.WindowRounding = 10.0f;
+    style.ChildRounding = 8.0f;
+    style.PopupRounding = 8.0f;
+    style.FrameRounding = 6.0f;
+    style.GrabRounding = 6.0f;
+    style.TabRounding = 6.0f;
+    style.ScrollbarRounding = 8.0f;
+    style.WindowPadding = ImVec2(14.0f, 12.0f);
+    style.FramePadding = ImVec2(9.0f, 5.0f);
+    style.ItemSpacing = ImVec2(10.0f, 7.0f);
+    style.ItemInnerSpacing = ImVec2(7.0f, 4.0f);
+    style.ScrollbarSize = 13.0f;
+    style.WindowBorderSize = 1.0f;
+    style.WindowMenuButtonPosition = ImGuiDir_None;
+    ImVec4* const c = style.Colors;
+    c[ImGuiCol_WindowBg] = ImVec4(0.085f, 0.085f, 0.095f, 0.86f);
+    c[ImGuiCol_PopupBg] = ImVec4(0.085f, 0.085f, 0.095f, 0.94f);
+    c[ImGuiCol_Border] = ImVec4(1.0f, 1.0f, 1.0f, 0.09f);
+    c[ImGuiCol_TitleBg] = ImVec4(0.070f, 0.070f, 0.080f, 1.0f);
+    c[ImGuiCol_TitleBgActive] = ImVec4(0.115f, 0.115f, 0.130f, 1.0f);
+    c[ImGuiCol_FrameBg] = ImVec4(0.165f, 0.165f, 0.185f, 0.62f);
+    c[ImGuiCol_FrameBgHovered] = ImVec4(0.225f, 0.225f, 0.250f, 0.70f);
+    c[ImGuiCol_FrameBgActive] = ImVec4(0.285f, 0.285f, 0.320f, 0.80f);
+    c[ImGuiCol_SliderGrab] = ImVec4(0.560f, 0.570f, 0.610f, 1.0f);
+    c[ImGuiCol_SliderGrabActive] = ImVec4(0.890f, 0.660f, 0.280f, 1.0f);
+    c[ImGuiCol_CheckMark] = ImVec4(0.890f, 0.660f, 0.280f, 1.0f);
+    c[ImGuiCol_Header] = ImVec4(0.200f, 0.200f, 0.230f, 0.85f);
+    c[ImGuiCol_HeaderHovered] = ImVec4(0.400f, 0.305f, 0.135f, 0.95f);
+    c[ImGuiCol_HeaderActive] = ImVec4(0.480f, 0.370f, 0.165f, 1.0f);
+    c[ImGuiCol_TextDisabled] = ImVec4(0.520f, 0.520f, 0.545f, 1.0f);
 
     ImFontConfig font_config;
     font_config.FontDataOwnedByAtlas = false;
@@ -1054,7 +1115,9 @@ void OnFormatChange(vk::Format format) {
         initialized = false;
         ImGui::DestroyContext();
         std::printf("Overlay: ImGui Vulkan backend rebuild failed\n");
+        return;
     }
+    BbMenuBlur::OnBackendReset(); // the backend's descriptor pool was destroyed
 }
 
 void UpdateTextInput(SDL_Window* window) {
@@ -1188,6 +1251,11 @@ bool Visible() {
     return initialized && (menu_open || BbSettings::Get().show_fps);
 }
 
+/// Whether the frosted backdrop should be recorded this frame (the menu is open).
+bool WantsBlur() {
+    return menu_open;
+}
+
 bool CapturesInput() {
     return menu_open;
 }
@@ -1217,10 +1285,17 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         style.FontScaleMain = scale;
         base_scale = scale;
     }
+    // Menu open ramp: ~0.14s in, instant out (the frame sharpens at once).
+    if (menu_open) {
+        menu_anim = std::min(menu_anim + io.DeltaTime * 7.0f, 1.0f);
+    } else {
+        menu_anim = 0.0f;
+    }
 
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
     if (menu_open) {
+        DrawBackdrop();
         Menu();
     }
     if (BbSettings::Get().show_fps && !menu_open) {

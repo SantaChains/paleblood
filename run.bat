@@ -19,6 +19,21 @@ if not exist "%BB_PYTHON%" (
     pause
     exit /b 1
 )
+rem First run: ask for the game dump once and remember it (run_windows.py reads out\game_dir.txt).
+if exist "out\game_dir.txt" goto have-game
+if defined BB_GAME_DIR goto have-game
+echo %* | findstr /C:"--game-dir" >nul && goto have-game
+set /p "GAME_DIR=First run: enter the path to your Bloodborne 1.09 dump (the folder containing eboot.bin): "
+if not defined GAME_DIR exit /b 1
+if not exist "%GAME_DIR%\eboot.bin" (
+    echo No eboot.bin in "%GAME_DIR%" - that folder is not a game dump.
+    pause
+    exit /b 1
+)
+mkdir out 2>nul
+>"out\game_dir.txt" echo %GAME_DIR%
+:have-game
+
 "%BB_PYTHON%" "scripts\run_windows.py" %*
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (

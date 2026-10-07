@@ -25,7 +25,7 @@ PowerShell 中的一条完整命令：
 ```powershell
 $env:MSYSTEM='CLANG64'; $env:CHERE_INVOKING='1'
 $env:GIT_CONFIG_COUNT='1'; $env:GIT_CONFIG_KEY_0='http.sslBackend'; $env:GIT_CONFIG_VALUE_0='openssl'
-& D:\langcode\MSYS64\usr\bin\bash.exe -lc 'bash build.sh'
+& $env:BB_MSYS2\usr\bin\bash.exe -lc 'bash build.sh'   # 或 C:\msys64\usr\bin\bash.exe
 ```
 
 关键纪律：构建输出必须重定向到文件，例如 `bash build.sh > out/build.log 2>&1`。宿主 PowerShell 与 MSYS 子进程之间的 stdout 管道会间歇性报 Bad file descriptor，症状是 cmake 段静默 exit 1 且零输出，看起来像真实失败，实际是假象。自动化测试同理，一律文件重定向，不要把后台失败直接当 bug。
@@ -83,7 +83,7 @@ $env:GIT_CONFIG_COUNT='1'; $env:GIT_CONFIG_KEY_0='http.sslBackend'; $env:GIT_CON
 ## 调试
 
 - out\bb-probe.exe 是 RelWithDebInfo 加 ThinLTO，内含 DWARF 调试信息。
-- 崩溃地址符号化：取 RIP 减去基址 0x140000000 的偏移，执行 D:\langcode\MSYS64\clang64\bin\llvm-symbolizer.exe --obj out\bb-probe.exe 0x偏移，直接得到源码行；llvm-objdump -d 可看崩溃处指令。
+- 崩溃地址符号化：取 RIP 减去基址 0x140000000 的偏移，执行 %BB_MSYS2%\clang64\bin\llvm-symbolizer.exe --obj out\bb-probe.exe 0x偏移，直接得到源码行；llvm-objdump -d 可看崩溃处指令。
 - guest 页错误在 Windows 走 VEH 恢复，GPU NOACCESS 页的裸写会先进 VEH 标脏再解保护重试，这是正常路径不是 bug。
 - 常用诊断变量：BB_FRAME_STATS=1 帧统计、BB_GPU_PROFILE=1 每 pass GPU 耗时、BB_PIPE_TIMEOUT_S 看门狗秒数、BB_DRAW_PIPE=0 关双阶段绘制隔离问题、BB_UPSCALER=none 排除超分。
 - 游戏日志与运行目录都在 out\，补丁与 mod 合并产物由 run_windows.py 每次启动重建。

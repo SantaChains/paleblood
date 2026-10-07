@@ -403,6 +403,93 @@ GraphicsPipeline::GraphicsPipeline(
     // In practice, we use dynamic state for all of it.
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
+    const auto create_pipeline = [&](const vk::GraphicsPipelineCreateInfo& info,
+                                     vk::UniquePipeline& out, std::string_view name) {
+        auto [pipeline_result, pipe] = device.createGraphicsPipelineUnique(pipeline_cache, info);
+        ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create {} pipeline: {}",
+                   name, vk::to_string(pipeline_result));
+        out = std::move(pipe);
+        SetObjectName(device, *out, "{} {}", name, debug_str);
+    };
+
+    // bbport: with VK_EXT_graphics_pipeline_library the pipeline is compiled as a
+    // pre-rasterization library (vertex input interface + pre-rasterization shaders) and a
+    // fragment library (fragment shader state + fragment output interface), then linked.
+    // Drivers cache the compiled subsets, so a first-seen combination of already-compiled
+    // vertex and fragment programs only pays the link cost instead of a full compilation.
+    boost::container::static_vector<vk::PipelineShaderStageCreateInfo, MaxShaderStages>
+        pre_stages;
+    boost::container::static_vector<vk::PipelineShaderStageCreateInfo, 1> frag_stages;
+    for (const auto& stage_ci : shader_stages) {
+        if (stage_ci.stage == vk::ShaderStageFlagBits::eFragment) {
+            frag_stages.push_back(stage_ci);
+        } else {
+            pre_stages.push_back(stage_ci);
+        }
+    }
+
+    if (instance.IsGraphicsPipelineLibraryEnabled() && !pre_stages.empty()) {
+        // Rendering info and its pNext chain are shared state of several subsets and must
+        // match exactly between the libraries and the final pipeline, so the same chain is
+        // passed everywhere. The dynamic state list is likewise passed to both libraries;
+        // each only consumes the states of its own subsets.
+        const vk::GraphicsPipelineLibraryCreateInfoEXT pre_subset = {
+            .pNext = &pipeline_rendering_ci,
+            .flags = vk::GraphicsPipelineLibraryFlagBitsEXT::eVertexInputInterface |
+                     vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders,
+        };
+        const vk::GraphicsPipelineCreateInfo pre_info = {
+            .pNext = &pre_subset,
+            .flags = vk::PipelineCreateFlagBits::eLibraryKHR,
+            .stageCount = static_cast<u32>(pre_stages.size()),
+            .pStages = pre_stages.data(),
+            .pVertexInputState =
+                !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
+            .pInputAssemblyState = &input_assembly,
+            .pTessellationState = &tessellation_state,
+            .pViewportState = &viewport_info,
+            .pRasterizationState = &raster_chain.get(),
+            .pDynamicState = &dynamic_info,
+            .layout = *pipeline_layout,
+        };
+
+        // A pipeline without a fragment shader stage is the documented depth-only pattern:
+        // the fragment shader subset is included with an empty stage list.
+        const vk::GraphicsPipelineLibraryCreateInfoEXT frag_subset = {
+            .pNext = &pipeline_rendering_ci,
+            .flags = vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader |
+                     vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentOutputInterface,
+        };
+        const vk::GraphicsPipelineCreateInfo frag_info = {
+            .pNext = &frag_subset,
+            .flags = vk::PipelineCreateFlagBits::eLibraryKHR,
+            .stageCount = static_cast<u32>(frag_stages.size()),
+            .pStages = frag_stages.data(),
+            .pMultisampleState = &sdata.multisampling,
+            .pDepthStencilState =
+                !instance.IsExtendedDynamicState3Supported() ? &depth_stencil_info : nullptr,
+            .pColorBlendState = &color_blending,
+            .pDynamicState = &dynamic_info,
+            .layout = *pipeline_layout,
+        };
+
+        create_pipeline(pre_info, pre_raster_lib, "Graphics PreRaster Lib");
+        create_pipeline(frag_info, fragment_lib, "Graphics Fragment Lib");
+
+        const std::array<vk::Pipeline, 2> libraries = {*pre_raster_lib, *fragment_lib};
+        const vk::PipelineLibraryCreateInfoKHR link_libs = {
+            .pNext = &pipeline_rendering_ci,
+            .libraryCount = static_cast<u32>(libraries.size()),
+            .pLibraries = libraries.data(),
+        };
+        const vk::GraphicsPipelineCreateInfo link_info = {
+            .pNext = &link_libs,
+            .layout = *pipeline_layout,
+        };
+        create_pipeline(link_info, pipeline, "Graphics Pipeline");
+        return;
+    }
+
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
         .stageCount = static_cast<u32>(shader_stages.size()),
@@ -419,16 +506,15 @@ GraphicsPipeline::GraphicsPipeline(
         .pDynamicState = &dynamic_info,
         .layout = *pipeline_layout,
     };
-
-    auto [pipeline_result, pipe] =
-        device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
-    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
-               vk::to_string(pipeline_result));
-    pipeline = std::move(pipe);
-    SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
+    create_pipeline(pipeline_info, pipeline, "Graphics Pipeline");
 }
 
-GraphicsPipeline::~GraphicsPipeline() = default;
+GraphicsPipeline::~GraphicsPipeline() {
+    // Fast-linked (non-LTO) pipelines are allowed to keep references to the libraries they
+    // were linked from, so the linked pipeline must be released before the subset libraries
+    // held by this class (destroyed after the destructor body).
+    pipeline.reset();
+}
 
 template <typename Attribute, typename Binding>
 void GraphicsPipeline::GetVertexInputs(

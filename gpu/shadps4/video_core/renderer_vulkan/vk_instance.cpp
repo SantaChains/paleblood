@@ -218,6 +218,7 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
         vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR,
+        vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT,
         vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>();
     features = feature_chain.get().features;
 
@@ -295,6 +296,14 @@ bool Instance::CreateDevice() {
     depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
     depth_clip_enable = add_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
     vertex_input_dynamic_state = add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+    // bbport: build graphics pipelines as pre-rasterization and fragment libraries and link
+    // them, so a novel state combination at first draw only pays the link instead of a full
+    // compilation. Needs the KHR dependency extension plus the device feature.
+    graphics_pipeline_library =
+        feature_chain.get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>()
+            .graphicsPipelineLibrary &&
+        add_extension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+        add_extension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
     list_restart = add_extension(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME);
     if (list_restart) {
         list_restart_features =
@@ -503,6 +512,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT{
             .vertexInputDynamicState = true,
         },
+        vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT{
+            .graphicsPipelineLibrary = true,
+        },
         vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT{
             .primitiveTopologyListRestart = list_restart_features.primitiveTopologyListRestart,
             .primitiveTopologyPatchListRestart =
@@ -579,6 +591,9 @@ bool Instance::CreateDevice() {
     }
     if (!vertex_input_dynamic_state) {
         device_chain.unlink<vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT>();
+    }
+    if (!graphics_pipeline_library) {
+        device_chain.unlink<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
     }
     if (!list_restart) {
         device_chain.unlink<vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT>();

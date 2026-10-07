@@ -34,3 +34,14 @@ patches.json
 steam_appid.txt
 
 imgui-liquid-glass/
+
+# Publication hygiene: user-supplied game content, vendor binaries and Sony-owned art never enter the repo
+/patches/
+/dumps/
+/savedata/
+/sys_modules/
+/mods/
+/dlss/
+/nvngx*.dll
+/patches-stamp.json
+/logo/bg2.jpg

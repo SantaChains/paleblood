@@ -115,6 +115,10 @@ private:
 private:
     GraphicsPipelineKey key;
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
+    // bbport: GPL subsets the pipeline is linked from. Fast-linked pipelines may reference
+    // their libraries, so these must outlive the base `pipeline` handle (see destructor).
+    vk::UniquePipeline pre_raster_lib;
+    vk::UniquePipeline fragment_lib;
 };
 
 struct ClipDistanceShaderKey {

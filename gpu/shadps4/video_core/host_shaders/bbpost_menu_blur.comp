@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport menu backdrop blur: one separable gaussian pass over the quarter-res downsample of
+// the composited swapchain image. The horizontal pass reads the blit target and writes the
+// ping-pong image; the vertical pass reads it back into the blit target, which the overlay
+// then samples behind the settings menu. 13 taps at a 2-texel stride reach a ~40px radius at
+// display resolution; the tiny image keeps the cost near zero, and nothing is recorded at
+// all while the menu is closed.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D src_tex;
+layout(binding = 1, rgba8) uniform writeonly image2D dst_img;
+
+layout(push_constant) uniform Params {
+    vec2 size; // pixels
+    vec2 dir;  // tap step in texels, stride included: (2,0) or (0,2)
+};
+
+// 13-tap gaussian, sigma 2.5, normalized.
+const float W[7] = float[](0.16101, 0.14862, 0.11691, 0.07837, 0.04476, 0.02179, 0.00904);
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(size.x) || p.y >= int(size.y)) {
+        return;
+    }
+    const ivec2 st = ivec2(round(dir));
+    const ivec2 hi = ivec2(size) - 1;
+    vec3 acc = W[0] * texelFetch(src_tex, p, 0).rgb;
+    for (int i = 1; i < 7; ++i) {
+        acc += W[i] * (texelFetch(src_tex, clamp(p + st * i, ivec2(0), hi), 0).rgb +
+                       texelFetch(src_tex, clamp(p - st * i, ivec2(0), hi), 0).rgb);
+    }
+    imageStore(dst_img, p, vec4(acc, 1.0));
+}

@@ -32,6 +32,9 @@ void UpdateTextInput(SDL_Window* window);
 /// Whether anything is drawn this frame (menu open or FPS counter on).
 bool Visible();
 
+/// Whether the frosted backdrop should be recorded this frame (the menu is open).
+bool WantsBlur();
+
 /// Present thread: draws into `view` (layout ColorAttachmentOptimal).
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
 

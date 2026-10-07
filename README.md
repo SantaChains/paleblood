@@ -1,146 +1,169 @@
-# bbport — Bloodborne PS4 原生移植
+[English](README.md) · [简体中文](README.zh.md)
 
-bbport 将《血源诅咒》的 PlayStation 4 官方可执行文件直接运行在 x86-64 PC 上。它不是通用模拟器：游戏自身的 x86-64 代码原生执行，一个专为这一款游戏编写的小型运行时取代 PS4 系统库，GPU 部分由 [shadPS4](https://github.com/shadps4-emu/shadPS4) 的渲染核心派生并针对本作深度扩展。没有 CPU 模拟，没有逐指令翻译，游戏全速运行。
+# bbport — a native PC port of Bloodborne
 
-本仓库的 windows-port 分支提供原生 Windows 版本，在 Linux 版基础上新增 NVIDIA DLSS 超分、游戏内作弊引擎、完整的手柄与中文支持。
+bbport runs the official PlayStation 4 executable of *Bloodborne* directly on x86-64 PCs. It is not a general-purpose emulator: the game's own x86-64 code executes natively, a small runtime written for this one title replaces the PS4 system libraries, and the GPU side is derived from the [shadPS4](https://github.com/shadps4-emu/shadPS4) rendering core with deep game-specific extensions. No CPU emulation, no per-instruction translation — the game runs at full speed.
 
-## 免责声明
+The `windows-port` branch is the native Windows version; it adds NVIDIA DLSS upscaling, an in-game cheat engine, full gamepad support and Chinese text on top of the original Linux version.
 
-- 本项目仅供学习与技术研究，禁止用于商业用途。
-- 仓库不分发任何游戏文件、游戏资产或解密密钥。使用前必须自备合法获得的《血源诅咒》数字版 dump，版本 1.09。
-- 本项目与 Sony Interactive Entertainment、FromSoftware 无任何关联，Bloodborne 名称与相关商标归其权利人所有。
-- 因安装、使用本项目产生的任何直接或间接后果由使用者自行承担。
-- 社区补丁与作弊文件版权归原作者，启用前请自行确认其内容。
+## Disclaimer
 
-## 状态
+- This project is for learning and technical research only. Commercial use is prohibited.
+- The repository distributes **no game files, no game assets, no artwork, no fonts and no decryption keys**. You must supply a legally obtained dump of your own copy of *Bloodborne* (digital version, patch 1.09).
+- This project is not affiliated with Sony Interactive Entertainment or FromSoftware. *Bloodborne* and all related trademarks belong to their respective owners.
+- Community patches and cheat files are **not bundled** — download them from their original authors (see *Mods and patches* below) and review their contents before enabling.
+- Use of this project is at your own risk; the authors are not responsible for any consequences.
 
-实验性但可玩。游戏可启动、可战斗、可存档，声音、手柄、存档均已验证，完整流程通关尚未验证。Windows 侧在 NVIDIA RTX 40 系显卡与 1080p/1440p 输出下验证；AMD 显卡走 FSR 路径，FSR 4.1.1 目前仅 RADV 驱动可用。
+## Status
 
-## 特性
+Experimental but playable. The game boots, combat works, saving works; audio, gamepads and saves are verified, the full game has not been completed end to end. Verified on NVIDIA RTX 40-series GPUs at 1080p/1440p output. AMD GPUs use the FSR path; FSR 4.1.1 currently requires the RADV driver.
 
-- 原生执行。eboot 离线转换为平铺内存映像，PS4 libc 与 libSceFios2 以原生代码链接进来，加载器与运行时约五千行 C。
-- 帧率解锁。社区补丁让模拟走真实帧时间，另有 30/60/90 FPS 定档模式。
-- 专为 Bloodborne 设计的时域超分。本作没有速度缓冲，bbport 自行计算运动向量：相机运动来自深度与场景矩阵，物体运动来自上一帧顶点位置；场景按 Halton 序列亚像素抖动并以较低分辨率渲染，UI 在输出分辨率原生绘制。
-  - DLSS，NVIDIA RTX 显卡的最佳选择，需要 nvngx_dlss.dll 放在可执行文件目录或 BB_DLSS_DIR 指向的目录。
-  - FSR 3.1（FireBurn/FSR-Vulkan）。
-  - FSR 4 INT8 与 FSR 4.1.1 INT8，需要 shader Float16、Int8/Int16、整数点积等 Vulkan 特性，不满足时启动前自动回退 FSR 3.1。
-  - TAA，原生分辨率时域抗锯齿，可与 FSR 实时互切，锐度控制同样生效。
-- 多线程 GPU 命令处理。命令流在一个线程解码、另一个线程绑定与录制 draw，双阶段流水线随硬件线程数扩展，附带无进展看门狗。
-- 游戏内菜单：Insert 或 L3+R3 打开，含超分、预设、锐度、输出分辨率、画面效果、免费相机与作弊页。
-- 作弊引擎：直接读取 GoldHEN 与 shadPS4 格式的 JSON 补丁，原生内存写入，游戏的代码洞补丁原样生效。
-- Mod 支持：松散文件目录按加载顺序覆盖原文件，原始游戏不被修改。
+## Features
 
-## 系统需求
+- Native execution. The eboot is converted offline into a flat memory image; PS4 libc and libSceFios2 are linked in as native code. The loader and runtime are about five thousand lines of C.
+- Frame-rate unlock. Community patches make the emulator honor real frame times; 30/60/90 FPS caps are also available.
+- Temporal upscaling designed for *Bloodborne*. The game has no motion buffers, so bbport computes motion vectors itself: camera motion from depth and scene matrices, object motion from previous-frame vertex positions. The scene is rendered at a lower resolution with Halton-sequence sub-pixel jitter; the UI is drawn natively at output resolution.
+  - DLSS — the best option on NVIDIA RTX cards. Requires `nvngx_dlss.dll` next to the executable or in `BB_DLSS_DIR`. The DLL is not distributed with this repository.
+  - FSR 3.1 (FireBurn/FSR-Vulkan).
+  - FSR 4 INT8 and FSR 4.1.1 INT8 — require Float16, Int8/Int16 and integer dot-product Vulkan features; falls back to FSR 3.1 automatically at startup when unsupported.
+  - TAA — native-resolution temporal anti-aliasing, hot-swappable with FSR; the sharpness slider applies to both.
+- Multithreaded GPU command processing. The command stream is decoded on one thread while another thread binds resources and records draws — a two-stage pipeline that scales with hardware threads, with a no-progress watchdog.
+- In-game menu: open with Insert or L3+R3. Upscaling, presets, sharpness, output resolution, picture effects, free camera and a cheats page.
+- Cheat engine: reads GoldHEN and shadPS4 JSON cheat files directly, writes memory natively; the game's code-cave patches work as-is.
+- Mod support: loose-file directories override original files in load order; the original game is never modified.
 
-- Windows 10 1803 或更新的 64 位系统，或 Linux x86-64。
-- Vulkan 1.3 显卡。DLSS 需要 NVIDIA RTX 显卡；FSR 4/4.1.1 需要相应 shader 特性，FSR 4.1.1 另需 VK_VALVE_shader_mixed_float_dot_product 扩展。
-- 游戏目录：任一区服的 1.09 版 dump，含 eboot.bin 与 sce_module，如 CUSA03173、CUSA03023、CUSA00900。
-- 构建依赖见下文快速开始。
+## Requirements
 
-## 快速开始（Windows）
+- Windows 10 1803 or newer 64-bit, or Linux x86-64.
+- A Vulkan 1.3 GPU. DLSS needs an NVIDIA RTX card; FSR 4/4.1.1 need the shader features listed above (4.1.1 additionally `VK_VALVE_shader_mixed_float_dot_product`).
+- Game directory: a 1.09 dump of any region, containing `eboot.bin` and `sce_module` — e.g. CUSA03173, CUSA03023, CUSA00900.
+- Community patch XML for frame-rate unlock and render-resolution presets (see *Mods and patches*) — required, the launch fails without one.
 
-方式一，一键安装。双击 setup.bat，在窗口中选择游戏目录与设置，点 Install/Update 会自动安装 MSYS2、依赖包与子模块并构建，同时生成 bbport.ini、桌面快捷方式与开始菜单项；Save settings 只保存设置不构建。
+## Quick start (Windows)
 
-方式二，手动。
+Option 1 — one-click setup (recommended). Double-click `setup.bat`: a window opens where you pick the game directory and settings, then Install/Update installs MSYS2 and all packages, builds, and generates `bbport.ini` plus shortcuts. No shell, no typing. Run it again any time to change settings; Save settings stores them without building.
 
-1. 安装 [MSYS2](https://www.msys2.org)，默认位置 C:\msys64，其他位置需设置系统环境变量 BB_MSYS2 指向安装目录。CLANG64 shell 中安装依赖：
+Option 2 — manual, three pasted commands.
+
+1. Install [MSYS2](https://www.msys2.org) with the installer defaults (`C:\msys64`; if you change it, also set the `BB_MSYS2` user environment variable).
+2. Paste this single line into plain cmd or PowerShell — do not open any MSYS2 shell, the script picks the right environment:
 
    ```
-   pacman -S --needed git mingw-w64-clang-x86_64-{clang,lld,libc++,cmake,ninja,pkgconf,python,sdl3,boost,fmt,glslang,spirv-cross,spirv-headers,vulkan-headers,vulkan-loader,vulkan-memory-allocator,xxhash,zydis,robin-map,ffmpeg}
+   C:\msys64\usr\bin\bash.exe -lc "pacman -S --needed git mingw-w64-clang-x86_64-{clang,lld,libc++,cmake,ninja,pkgconf,python,sdl3,boost,fmt,glslang,spirv-cross,spirv-headers,vulkan-headers,vulkan-loader,vulkan-memory-allocator,xxhash,zydis,robin-map,ffmpeg}"
    ```
 
-2. 克隆本仓库（含子模块），从 cmd 或资源管理器运行：
+3. Clone this repository with any git client, then double-click:
 
    ```
    run.bat --game-dir D:\Games\CUSA03023
    ```
 
-编译与运行分离：build.bat 专职构建（build_windows.py），run.bat 直接启动游戏、从不等待编译。首次使用先跑 build.bat（耗时数分钟，产物 out\bb-probe.exe），游戏目录会被记住，之后直接双击 run.bat。改过源码后 run.bat 会立即用现有程序启动，同时在后台低优先级重建，下次启动生效。
+Building and running are separate: `build.bat` only builds (`scripts/build_windows.py`); `run.bat` starts the game directly and never waits for a build. On first launch `run.bat` asks for the game directory and remembers it in `out\game_dir.txt`; afterwards a plain double-click starts the game. If sources changed, `run.bat` starts with the existing binary immediately and rebuilds in the background at low priority — the next launch picks it up.
 
-run.bat 内部调用 scripts\run_windows.py：准备游戏映像、链接模块、编译补丁与 mod 合并目录，然后启动游戏。存档在 user\，mod 在 mods\，补丁配置在 patches\，均为数据目录下的子目录。
+`run.bat` calls `scripts\run_windows.py`: it prepares the game image, links modules, compiles patches, assembles the merged mod directory, then starts the game. Saves live in `user\`, mods in `mods\`, patch XML in `patches\`, all under the data directory.
 
-## bbport.ini 设置
+For an AI-assisted setup (a checklist an AI assistant can follow to configure every path), see [docs/AI-SETUP.md](docs/AI-SETUP.md).
 
-仓库根目录的 bbport.ini，格式为 key = value，# 开头为注释。同名环境变量优先于文件。
+## Configuration (bbport.ini)
 
-- language：告知游戏的 PS4 系统语言。11 简体中文，10 繁体中文，1 英语美国。1.09 dump 自带官方中文文本，无需额外 mod。
-- pad_swap：1 交换 A/B 与 X/Y 面键，适配报告 Nintendo 布局的手柄，如 Switch 模式的飞智；0 保持标准映射。
-- gc_budget_mb：纹理缓存预算，单位 MiB。内置默认 2515，对 8GB 显存偏紧，推荐 4096。
-- present_mode：呈现模式。mailbox 默认低延迟，fifo 强制垂直同步，immediate 无同步。对应环境变量 BB_PRESENT_MODE。
-- fullscreen：1 为无边框全屏，与游戏内 F11 等效。
-- output_res：输出分辨率，如 3840x2160；与 preset 配合决定渲染分辨率补丁。
-- preset：超分预设，决定内部渲染分辨率。
-- live_resolution：0、1 或 auto。1 时游戏保持 1080p 内部渲染、运行时缩放渲染目标，改输出与预设免重启，代价是负载更高；auto 仅对 8GB 以上独立显卡开启；1080p 输出与 TAA 恒走实时路径。
+`bbport.ini` sits in the repository root, `key = value` format, `#` starts a comment. Same-named environment variables take precedence.
 
-## 游戏内操作
+- language: PS4 system language reported to the game. 11 = Simplified Chinese, 10 = Traditional Chinese, 1 = English (US). The 1.09 dump ships official Chinese text; no mod needed.
+- pad_swap: 1 swaps A/B and X/Y for pads that report the Nintendo layout (e.g. Flydigi in Switch mode); 0 keeps standard mapping.
+- gc_budget_mb: texture cache budget in MiB. Built-in default 2515 is tight for 8 GB cards; 4096 recommended.
+- present_mode: `mailbox` (default, low latency), `fifo` (forced VSync), `immediate` (no sync). Env: `BB_PRESENT_MODE`.
+- fullscreen: 1 = borderless fullscreen, same as F11 in-game.
+- output_res: output resolution, e.g. 3840x2160; combined with preset it drives the render-resolution patch.
+- preset: upscaling preset, determines internal render resolution.
+- live_resolution: 0, 1 or auto. 1 keeps the game rendering at 1080p internally and scales render targets at runtime — output and preset changes without restart, at higher load; auto enables it only on discrete GPUs with more than 8 GB; 1080p output and TAA always use the live path.
 
-- Insert 或 L3+R3：bbport 设置菜单，含超分、锐度、效果开关与作弊页；部分改动需 Apply and restart 生效。
-- F11：无边框全屏切换。
-- 免费相机：菜单开启后重启生效，按住 Cross 再按 L3 切换模式，键盘为按住 Space 按 Z。与 Enemy Control 互斥。
-- 游戏调试菜单：先将 DbgFont14h.ccm 与 DbgFont14h.tpf 放入游戏 dvdroot_ps4\font\，再在菜单启用并重启；左触摸板或 Tab 打开，Backspace 等效右触摸板。
+## Paths
 
-## 作弊
+Everything user-specific is pointed at, never bundled:
 
-直接使用 GoldHEN 与 shadPS4 Qt 的作弊 JSON 文件，字段含 name、id、version、process、mods，offset 为相对 eboot 模块基址的偏移。目录解析顺序：
+| What                                  | Where                                          | Override                    |
+|---------------------------------------|------------------------------------------------|-----------------------------|
+| Game dump (eboot.bin, sce_module)     | any location, remembered in `out\game_dir.txt` | `--game-dir`, `BB_GAME_DIR` |
+| Patch XML (shadPS4 format)            | `patches\`                                     | `BB_PATCHES_DIR`            |
+| Mods (one subdirectory each)          | `mods\`                                        | `BB_MODS_DIR`               |
+| Cheat JSON (GoldHEN / shadPS4 format) | `cheats\`                                      | `BB_CHEATS_DIR`             |
+| Saves                                 | `user\`                                        | `BB_USER_DIR`               |
+| nvngx_dlss.dll                        | next to the executable                         | `BB_DLSS_DIR`               |
+| FSR 4.1.1 assets                      | `fsr4_411\`                                    | `BB_FSR411_DIR`             |
+| Settings                              | `bbport.ini`                                   | `BB_CONFIG`                 |
 
-1. 环境变量 BB_CHEATS_DIR。
-2. bbport.ini 所在目录下的 cheats\。
-3. 当前工作目录下的 cheats\。
+## In-game controls
 
-规则：process 不是 eboot.bin 或 id 与游戏序列号不符的文件静默过滤；version 不匹配打印跳过原因；无关闭补丁的 one-way 条目在菜单中呈禁用态；开关状态持久化到 cheats 目录的 state.txt，重启恢复；master 是需手动勾选的 opt-in 总开关。样例见 bbconf 仓库的 CUSA03023_01.09_shadPS4.json。
+- Insert or L3+R3: bbport menu — upscaling, sharpness, effects, cheats; some changes need Apply and restart.
+- F11: borderless fullscreen toggle.
+- Free camera: enabled via the menu (restart needed). Hold Cross and press L3 to switch modes; on keyboard hold Space and press Z. Mutually exclusive with Enemy Control.
+- Debug menu: put `DbgFont14h.ccm` and `DbgFont14h.tpf` from your dump's extra data into the game's `dvdroot_ps4\font\`, enable it in the menu and restart; left touchpad or Tab opens it, Backspace acts as right touchpad.
 
-## Mod 与补丁
+## Cheats
 
-- Mod：mods\ 下每个子目录为一个 mod，可含 dvdroot_ps4\、一层包装目录或直接是 chr\ 等游戏目录；文件名大小写不敏感，后加载覆盖先加载，启用与顺序记录在 mods.json。
-- 补丁：patches\ 下放置 shadPS4 格式 XML，启动时编译进 patches.bin。帧率、渲染分辨率、画面效果开关均走此通道。
-- 细节见 docs\MODS.md。
+GoldHEN and shadPS4 Qt cheat JSON files are used directly: fields `name`, `id`, `version`, `process`, `mods`; offsets are relative to the eboot module base. Directory resolution order:
 
-## 常用环境变量
+1. `BB_CHEATS_DIR` environment variable.
+2. `cheats\` next to `bbport.ini`.
+3. `cheats\` in the current working directory.
 
-环境变量优先于 bbport.ini，多数场景只需改文件。
+Rules: files whose `process` is not `eboot.bin` or whose `id` mismatches the game serial are silently filtered; version mismatches are logged with the reason; one-way entries without an off-patch show as disabled in the menu; toggle state persists to `state.txt` in the cheats directory; `master` is an opt-in master switch. A bundled sample, `cheats/CUSA03023_01.09_shadPS4.json`, comes from the [GoldHEN Cheat Repository](https://github.com/GoldHEN/GoldHEN_Cheat_Repository) (GPL-3.0); credits are inside the file.
 
-- BB_GAME_DIR 游戏目录；BB_MSYS2 MSYS2 位置（也可设为用户环境变量，后台构建会读注册表）。
-- BB_LANGUAGE、BB_PAD_SWAP、BB_GC_BUDGET_MB、BB_PRESENT_MODE：对应同名 ini 键。
-- BB_DRAW_PIPE=0：关闭双阶段绘制，退回单线程 GPU 路径，用于排查渲染问题。
-- BB_PIPE_TIMEOUT_S：draw 录制线程无进展看门狗秒数，默认 120，0 关闭。
-- BB_UPSCALER=none：禁用时域超分。
-- BB_FRAME_STATS=1 帧统计；BB_GPU_PROFILE=1 每 pass GPU 耗时；BB_FSR4_PROFILE=1 FSR 4 每 pass 耗时。
-- BB_FRAMES_AHEAD：GPU 命令线程领先 GPU 的帧数，默认 1，0 不限。
-- BB_LIVE_RES=1：实时分辨率切换。
-- BB_DLSS_DIR：nvngx_dlss.dll 搜索目录，默认还搜索可执行文件目录。
-- BB_CHEATS_DIR 作弊目录；BB_DATA_DIR、BB_CONFIG、BB_USER_DIR、BB_MODS_DIR、BB_PATCHES_DIR 重定向数据位置。
+## Mods and patches
 
-## 故障排查
+- Mods: each subdirectory of `mods\` is one mod, containing `dvdroot_ps4\`, a single wrapper directory, or game directories like `chr\` directly. Filenames are case-insensitive; later loads override earlier ones. To enable/disable or reorder mods, edit `mods.json` in the data directory (`{"order": [...], "disabled": [...]}`); new folders are enabled automatically. Details in [docs/MODS.md](docs/MODS.md).
+- Patches: shadPS4-format XML placed in `patches\` is compiled into `patches.bin` at launch. Frame-rate unlock, render resolution and effect toggles all go through this channel.
+- **Community patches are not distributed in this repository.** Download them from their original authors or community patch repositories (e.g. the [GoldHEN](https://github.com/GoldHEN) patch collection) and drop the XML into `patches\`. Patch credits belong to Kyo, Lance McDonald, auser1337, illusion, emoose and other community members.
 
-- 提交阶段报 Device lost，日志反复出现 memory pressure 且 0 images evicted：流送纹理工作集超出预算，调高 gc_budget_mb。
-- 窗口冻结无响应：看门狗会在 BB_PIPE_TIMEOUT_S 秒后以错误终止而不是挂死，日志可见 StallFatal。
-- run.bat 失败时窗口保持打开，错误直接可见；找不到 MSYS2 Python 时按提示装 MSYS2 或设 BB_MSYS2，注意环境变量只对新进程生效。
-- 中文未生效：确认 language = 11 且 dump 为 1.09。
-- 手柄按键与预期相反：pad_swap = 1。
-- 渲染异常：BB_DRAW_PIPE=0 复测；仍异常再用 BB_UPSCALER=none 排除超分。
+## Useful environment variables
 
-## Linux 版
+Environment variables take precedence over `bbport.ini`; in most cases editing the file is enough.
 
-原始 Linux 版继续受支持：
+- `BB_GAME_DIR` game directory; `BB_MSYS2` MSYS2 location (also readable from the user environment registry for background builds).
+- `BB_LANGUAGE`, `BB_PAD_SWAP`, `BB_GC_BUDGET_MB`, `BB_PRESENT_MODE`: mirror the same-named ini keys.
+- `BB_DRAW_PIPE=0`: disable the two-stage draw pipeline (single-threaded GPU path), for rendering troubleshooting.
+- `BB_PIPE_TIMEOUT_S`: draw-recording watchdog seconds, default 120, 0 disables.
+- `BB_UPSCALER=none`: disable temporal upscaling.
+- `BB_FRAME_STATS=1` frame statistics; `BB_GPU_PROFILE=1` per-pass GPU timings; `BB_FSR4_PROFILE=1` FSR 4 per-pass timings.
+- `BB_FRAMES_AHEAD`: frames the GPU command thread runs ahead, default 1, 0 unlimited.
+- `BB_LIVE_RES=1`: live resolution switching.
+- `BB_DLSS_DIR`: search directory for nvngx_dlss.dll.
+- `BB_CHEATS_DIR`, `BB_DATA_DIR`, `BB_CONFIG`, `BB_USER_DIR`, `BB_MODS_DIR`, `BB_PATCHES_DIR`: relocate the corresponding data locations.
+- `BB_VK_VALIDATION=1`: enable Vulkan core validation (development tool; costs performance).
+
+## Troubleshooting
+
+- Device lost at submit with `memory pressure` lines showing `0 images evicted`: the streaming texture working set exceeds the budget — raise `gc_budget_mb`.
+- Frozen window: the watchdog terminates with an error after `BB_PIPE_TIMEOUT_S` seconds instead of hanging forever; the log shows StallFatal.
+- When `run.bat` fails the window stays open so the error is visible. If the MSYS2 Python is missing, install MSYS2 or set `BB_MSYS2` — note environment variables only reach new processes.
+- Chinese text not showing: check `language = 11` and a 1.09 dump.
+- Gamepad buttons swapped: `pad_swap = 1`.
+- Rendering glitches: retry with `BB_DRAW_PIPE=0`; if still broken, `BB_UPSCALER=none` rules out the upscaler.
+
+## Linux version
+
+The original Linux version remains supported:
 
 ```
 bash build.sh
 BB_GAME_DIR=/path/to/CUSA03173 bash run.sh
 ```
 
-GTK4 启动器、AppImage 打包与 Steam Deck 细节见 launcher\、packaging\ 与 docs\。
+GTK4 launcher, AppImage packaging and Steam Deck details in `launcher\`, `packaging\` and `docs\`.
 
-## 仓库结构
+## Repository layout
 
-- src\：加载器 probe.c 与 HLE 运行时 runtime_*.c；Windows 专属实现在 win32_*.c 与 host_sync.h。
-- scripts\：游戏映像离线准备、模块链接、补丁编译器、Windows 启动器 run_windows.py。
-- gpu\：渲染库。vendored 的 shadPS4 视频核加本项目改动，含 ImGui 菜单、DLSS/FSR、双阶段绘制管线与帧捕获。
-- patches\：社区补丁 XML。
-- tools\：开发与测量工具。
-- tests\：加载器、运行时、补丁与渲染测试，bash build.sh --test 运行。
-- documents\：中文文档，设计评审 design-review.zh.md、代码质量审查 quality-review.zh.md、开发者指南 dev-guide.zh.md。
-- docs\：设计笔记与测量数据，含超分、并行 GPU、运动向量与更新日志。
+- `src\`: the loader (probe.c) and HLE runtime (runtime_*.c); Windows-specific code in win32_*.c and host_sync.h.
+- `scripts\`: offline game-image preparation, module linking, the patch compiler, and the Windows launcher run_windows.py.
+- `gpu\`: the rendering library — vendored shadPS4 video core plus this project's changes: ImGui menu, DLSS/FSR, two-stage draw pipeline, frame capture.
+- `patches\`: place community patch XML here (not bundled with the repository).
+- `tools\`: development and measurement tools.
+- `tests\`: loader, runtime, patch and rendering tests — `bash build.sh --test`.
+- `documents\`: Chinese-language docs — design review, quality review, developer guide.
+- `docs\`: design notes and measurements, including upscaling, parallel GPU, motion vectors and changelogs.
 
-## 许可证与致谢
+## License and acknowledgements
 
-bbport 以 GNU GPL v2 或更新版本授权，包含 shadPS4 的 GPL-2.0-or-later 代码。第三方组件保留各自许可证：shadPS4 视频核与 shader 重编译器、sirit、half、FireBurn 的 FSR-Vulkan（MIT）、AMD FidelityFX SDK（MIT）、LibAtrac9（MIT）、Dear ImGui（MIT）、DejaVu 字体、dxil-spirv（MIT，用于构建 FSR 4.1.1 资产）。游戏补丁来自 Kyo、Lance McDonald、auser1337、illusion、emoose 等社区成员。AMD 的 FSR 4 DLL 与模型数据、NVIDIA 的 DLSS DLL 均不在本仓库分发。
+bbport is licensed under GNU GPL v2 or later and contains GPL-2.0-or-later code from shadPS4. Third-party components keep their own licenses: shadPS4 video core and shader recompiler, sirit (BSD-3-Clause), half (MIT), FireBurn's FSR-Vulkan (MIT), AMD FidelityFX SDK (MIT), LibAtrac9 (MIT), Dear ImGui (MIT), DejaVu fonts (DejaVu license), dxil-spirv (MIT, used to build FSR 4.1.1 assets). The cheat sample derives from the GoldHEN Cheat Repository (GPL-3.0). AMD's FSR 4 DLL and model data, NVIDIA's DLSS DLL, game patches and any game content are not distributed with this repository.
+
+The original Linux port and its community mirrors live at [yumlevi/bloodborne_pc](https://github.com/yumlevi/bloodborne_pc) and [deadinside28/bloodborne_pc](https://github.com/deadinside28/bloodborne_pc) — thanks to everyone who tested, debugged and shared feedback there. The shadPS4 team's renderer is the foundation of the GPU side; the community patch and cheat repositories make the frame-rate unlock and cheats possible.

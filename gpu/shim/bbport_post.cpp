@@ -99,6 +99,9 @@ float DebandThreshold(int percent) {
 
 void DestroyImages() {
     const vk::Device device = Device();
+    if (mid_image || out_image) {
+        device.waitIdle(); // in-flight frames still reference the work images
+    }
     if (mid_view) {
         device.destroyImageView(mid_view);
         mid_view = nullptr;

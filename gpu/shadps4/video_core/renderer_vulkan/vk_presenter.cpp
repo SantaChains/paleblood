@@ -12,6 +12,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "bbport_menu_blur.h"
 #include "bbport_overlay.h"
 #include "bbport_post.h"
 #include "bbport_settings.h"
@@ -157,6 +158,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
     BbOverlay::Init(instance, swapchain.GetSurfaceFormat().format, num_images);
     BbPost::Init(instance);
+    BbMenuBlur::Init(instance);
 
     // bbport: the timeline semaphore the low latency sleep signals travel on.
     if (instance.IsLowLatencyCapable()) {
@@ -180,6 +182,7 @@ Presenter::~Presenter() {
     present_scheduler.Finish();
     flip_scheduler.Finish();
     BbPost::Shutdown();
+    BbMenuBlur::Shutdown();
     Check(draw_scheduler.CommandBuffer().reset());
     Check(present_scheduler.CommandBuffer().reset());
     Check(flip_scheduler.CommandBuffer().reset());
@@ -671,9 +674,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 .subresourceRange = color_range,
             },
         };
+        // The frame barrier's dstAccessMask carries eShaderRead when the post chain runs:
+        // that access needs a compute stage in the mask (VUID-02819/02820).
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-                               vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
-                               {}, {}, pre_barriers);
+                               use_post ? vk::PipelineStageFlagBits::eTransfer |
+                                              vk::PipelineStageFlagBits::eComputeShader
+                                        : vk::PipelineStageFlagBits::eTransfer,
+                               vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers);
         const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
         cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal, black, color_range);
         const vk::MemoryBarrier clear_done{
@@ -703,15 +710,28 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             BbOverlay::SetGcStats({gc.used_memory, gc.pressure_memory, gc.critical_memory,
                                    gc.evictions, gc.downloads});
         }
+        // bbport: while the menu is open the composited frame itself feeds the frosted
+        // backdrop: it detours through TransferSrcOptimal (the only blit-source layout the
+        // swapchain may take; it has no SAMPLED_BIT) and returns to ColorAttachmentOptimal
+        // inside BbMenuBlur::Record. The blur work images are R8G8B8A8Unorm, so only the SDR
+        // 4x8 format class qualifies (the HDR10 A2B10G10R10 swapchain is a different blit
+        // compatibility class and the menu draws on the plain dim there). Also gated on the
+        // overlay rendering: the to_present barrier below is the only path to ePresentSrcKHR.
+        const vk::Format swapchain_format = swapchain.GetSurfaceFormat().format;
+        const bool blur = overlay && BbOverlay::WantsBlur() &&
+                          (swapchain_format == vk::Format::eR8G8B8A8Unorm ||
+                           swapchain_format == vk::Format::eB8G8R8A8Unorm);
         const std::array post_barriers{
             vk::ImageMemoryBarrier{
                 .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-                .dstAccessMask = overlay ? vk::AccessFlagBits::eColorAttachmentRead |
-                                               vk::AccessFlagBits::eColorAttachmentWrite
-                                         : vk::AccessFlagBits::eNone,
+                .dstAccessMask = blur ? vk::AccessFlagBits::eTransferRead
+                                      : overlay ? vk::AccessFlagBits::eColorAttachmentRead |
+                                                      vk::AccessFlagBits::eColorAttachmentWrite
+                                                : vk::AccessFlagBits::eNone,
                 .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-                .newLayout = overlay ? vk::ImageLayout::eColorAttachmentOptimal
-                                     : vk::ImageLayout::ePresentSrcKHR,
+                .newLayout = blur ? vk::ImageLayout::eTransferSrcOptimal
+                                  : overlay ? vk::ImageLayout::eColorAttachmentOptimal
+                                            : vk::ImageLayout::ePresentSrcKHR,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .image = swapchain_image,
@@ -730,9 +750,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 .subresourceRange = color_range,
             },
         };
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        // srcAccessMask carries eShaderRead (the post chain's compute reads) when use_post:
+        // that access needs a compute stage in the source mask (VUID-02819).
+        cmdbuf.pipelineBarrier(use_post ? vk::PipelineStageFlagBits::eTransfer |
+                                              vk::PipelineStageFlagBits::eComputeShader
+                                        : vk::PipelineStageFlagBits::eTransfer,
                                vk::PipelineStageFlagBits::eAllCommands,
                                vk::DependencyFlagBits::eByRegion, {}, {}, post_barriers);
+        if (blur) {
+            BbMenuBlur::Record(cmdbuf, swapchain_image, extent.width, extent.height);
+        }
         if (overlay) {
             BbOverlay::Render(cmdbuf, swapchain.ImageView(), extent);
             const vk::ImageMemoryBarrier to_present{

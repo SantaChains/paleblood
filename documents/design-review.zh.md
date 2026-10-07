@@ -136,3 +136,4 @@ tiled 脏图写回同日落地(未编译): 见"进展(崩溃驱动)"第 4 条修
 - 上游 shadPS4: src/common/memory_patcher.cpp、src/common/config.cpp、src/qt_gui/cheats_patches.cpp、src/qt_gui/settings_dialog.cpp。
 - bbconf 样例: cheats/CUSA03023_01.09_shadPS4.json、patches/shadPS4/Bloodborne.xml。
 - 业界与学术: RPCS3 patch 体系与 custom config、Ryujinx ConfigurationState、yuzu Game Modding、GoldHEN Cheat Repository 格式、PostgreSQL clock-sweep(boringsql;arXiv 2512.22995)、C++ hazard pointer/RCU 提案(P0566 等)、Fossilize 录制/回放、Martin Fowler Feature Toggles、shadPS4 v0.17 GC 更新说明。
+- UI 参考(确认不采用): imgui-liquid-glass(https://github.com/SoyBeanMilkx/imgui-liquid-glass) 的液态玻璃菜单风格。菜单视觉最终走自实现背景模糊(bbport_menu_blur)与 ImGui 原生绘制,不引入该仓库实现。
