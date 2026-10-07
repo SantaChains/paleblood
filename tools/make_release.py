@@ -28,6 +28,7 @@ ROOT_FILES = [
     'README.zh.md',
     'README.md',
     'RELEASE.zh.md',
+    'THIRD-PARTY-LICENSES.md',
     'LICENSE',
 ]
 
@@ -70,17 +71,14 @@ def find_sdl3() -> Path:
 
 
 def detect_version() -> str:
-    """The release version: from git describe when available, else today's date."""
-    import subprocess
-    try:
-        tag = subprocess.run(['git', 'describe', '--tags', '--abbrev=0'], cwd=ROOT,
-                             capture_output=True, text=True, check=True).stdout.strip()
-        if tag:
-            return tag.lstrip('v')
-    except (OSError, subprocess.CalledProcessError):
-        pass
-    import datetime
-    return datetime.date.today().isoformat()
+    """The release version comes from the VERSION file at the repository root — the same
+    source the release workflow reads to decide whether to publish."""
+    version_file = ROOT / 'VERSION'
+    if version_file.is_file():
+        version = version_file.read_text(encoding='utf-8').strip()
+        if version:
+            return version
+    raise SystemExit(f'{version_file} is missing or empty (the release workflow reads it too)')
 
 
 def collect(dest: Path) -> int:
