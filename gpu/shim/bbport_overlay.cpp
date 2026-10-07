@@ -73,6 +73,11 @@ namespace {
 std::mutex imgui_mutex; // the ImGui context: window thread (input) and present thread
 std::atomic<bool> initialized{false};
 std::atomic<bool> menu_open{false};
+/// The page whose selection was last forced through ImGuiTabItemFlags_SetSelected. -1 = the
+/// next Menu() frame re-applies ui_page (start-up, or the first frame after reopening, when
+/// the tab bar's own selection may no longer exist). See Menu() for why the flag is raised
+/// only while this disagrees with the desired page.
+int applied_page = -1;
 bool l3_down = false, r3_down = false;
 float base_scale = 1.0f;
 float menu_anim = 0.0f; // open ramp 0..1 (the close stays instant)
@@ -120,6 +125,8 @@ void SetOpen(bool value) {
     }
     if (value) {
         menu_anim = 0.0f; // replay the open ramp on every open
+        applied_page = -1; // re-apply ui_page once on the first frame: the tab bar's own
+                           // selection may have been collected while the menu was closed
     }
     ImGui::GetIO().MouseDrawCursor = value;
     if (!value) {
@@ -1282,16 +1289,26 @@ void Menu() {
     // The selected tab is not one of the window properties ImGui stores by itself, so it
     // rides along in bbport.ini as ui_page (same path as ui_scale). Written on close with the
     // rest of the menu's changes, so the menu reopens on the page it was left on.
+    //
+    // ImGuiTabItemFlags_SetSelected must NOT be re-sent every frame: it queues a focus for
+    // its tab whenever the tab bar's SelectedTabId differs (imgui_widgets.cpp:10718), so a
+    // re-sent flag for the old page swallows the click on a new one the frame after the tab
+    // bar applies it, and the selection snaps back for good. The flag is therefore only
+    // raised while page and applied_page disagree — i.e. once, to restore ui_page after a
+    // restart (or if it ever changes from outside this loop); every later selection is the
+    // user's click and is left alone.
     auto& s = BbSettings::Get();
     int page = std::clamp(s.ui_page.load(), 0, int(PageCount) - 1);
+    const bool need_apply = page != applied_page;
     const float footer = ImGui::GetFrameHeightWithSpacing();
     if (ImGui::BeginTabBar("##pages")) {
         // BeginTabItem's second parameter is bool* (a close button), not a "selected" flag;
         // selection is requested with ImGuiTabItemFlags_SetSelected on the flags argument.
         for (int p = 0; p < PageCount; ++p) {
-            if (ImGui::BeginTabItem(PageName(p), nullptr,
-                                    p == page ? ImGuiTabItemFlags_SetSelected
-                                              : ImGuiTabItemFlags_None)) {
+            const ImGuiTabItemFlags flags = need_apply && p == page
+                                                ? ImGuiTabItemFlags_SetSelected
+                                                : ImGuiTabItemFlags_None;
+            if (ImGui::BeginTabItem(PageName(p), nullptr, flags)) {
                 page = p;
                 // The child's ID is the visible page name scoped under the tab's ID, so the
                 // per-page scroll position persists across switches and restarts.
@@ -1309,8 +1326,11 @@ void Menu() {
         }
         ImGui::EndTabBar();
     }
-    if (page != s.ui_page.load()) {
-        Store(s.ui_page, page, true);
+    if (page != applied_page) {
+        applied_page = page;
+        if (page != s.ui_page.load()) {
+            Store(s.ui_page, page, true);
+        }
     }
 
     if (ImGui::Button("关闭")) {
