@@ -1615,21 +1615,48 @@ bool HandleEvent(const SDL_Event& event) {
         if (!is_open) {
             return false;
         }
-        // Left stick navigates: official imgui_impl_sdl3 semantics (8000 dead-zone,
-        // dead-zone..full scale mapped to 0..1 analog, down at >0.1).
-        if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX ||
-            event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY) {
+        // Sticks and triggers follow official imgui_impl_sdl3 semantics (8000 dead-zone,
+        // dead-zone..full scale mapped to 0..1 analog, down at >0.1; triggers span the full
+        // 0..32767 range). Left stick navigates; the right stick and triggers complete the
+        // gamepad key set so future widgets (or third-party code via the shared io) see a
+        // whole pad instead of half of one.
+        const auto analog = [](float axis, float v0, float v1) {
+            return std::clamp((axis - v0) / (v1 - v0), 0.0f, 1.0f);
+        };
+        switch (event.gaxis.axis) {
+        case SDL_GAMEPAD_AXIS_LEFTX:
+        case SDL_GAMEPAD_AXIS_LEFTY:
+        case SDL_GAMEPAD_AXIS_RIGHTX:
+        case SDL_GAMEPAD_AXIS_RIGHTY: {
             const float raw = static_cast<float>(event.gaxis.value);
-            const auto analog = [](float axis, float v0, float v1) {
-                return std::clamp((axis - v0) / (v1 - v0), 0.0f, 1.0f);
-            };
-            const bool x = event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX;
+            const bool x = event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX ||
+                           event.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTX;
+            const bool left_stick = event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX ||
+                                    event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY;
             const float a_neg = analog(raw, -8000.0f, -32768.0f);
             const float a_pos = analog(raw, 8000.0f, 32767.0f);
-            io.AddKeyAnalogEvent(x ? ImGuiKey_GamepadLStickLeft : ImGuiKey_GamepadLStickUp,
-                                 a_neg > 0.1f, a_neg);
-            io.AddKeyAnalogEvent(x ? ImGuiKey_GamepadLStickRight : ImGuiKey_GamepadLStickDown,
-                                 a_pos > 0.1f, a_pos);
+            const ImGuiKey neg = left_stick ? (x ? ImGuiKey_GamepadLStickLeft
+                                                 : ImGuiKey_GamepadLStickUp)
+                                            : (x ? ImGuiKey_GamepadRStickLeft
+                                                 : ImGuiKey_GamepadRStickUp);
+            const ImGuiKey pos = left_stick ? (x ? ImGuiKey_GamepadLStickRight
+                                                 : ImGuiKey_GamepadLStickDown)
+                                            : (x ? ImGuiKey_GamepadRStickRight
+                                                 : ImGuiKey_GamepadRStickDown);
+            io.AddKeyAnalogEvent(neg, a_neg > 0.1f, a_neg);
+            io.AddKeyAnalogEvent(pos, a_pos > 0.1f, a_pos);
+            break;
+        }
+        case SDL_GAMEPAD_AXIS_LEFT_TRIGGER:
+        case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: {
+            const float a = std::clamp(static_cast<float>(event.gaxis.value) / 32767.0f, 0.0f, 1.0f);
+            io.AddKeyAnalogEvent(event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER
+                                     ? ImGuiKey_GamepadL2
+                                     : ImGuiKey_GamepadR2,
+                                 a > 0.1f, a);
+            break;
+        }
+        default: break;
         }
         return true;
     }
