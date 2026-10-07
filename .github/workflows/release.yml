@@ -22,6 +22,9 @@ permissions:
 
 env:
   VERSION_FILE: VERSION
+  # FindVulkan.cmake 在 MSYS2 shell 里没有 SDK 环境变量可循；clang64 的头与
+  # loader 布局（include/vulkan、lib/libvulkan.dll.a）正好符合 VULKAN_SDK 约定。
+  VULKAN_SDK: /clang64
 
 jobs:
   version:
