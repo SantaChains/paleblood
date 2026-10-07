@@ -587,12 +587,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     // bbport: frame limit (see EmulatorSettings::GetFrameLimit). A request waits in the queue
     // until its slot; slots advance by one period (no drift) but never lag behind by more.
-    const u32 frame_limit = EmulatorSettings.GetFrameLimit();
-    const auto frame_period = frame_limit ? std::chrono::nanoseconds(1000000000 / frame_limit)
-                                          : std::chrono::nanoseconds(0);
+    // The limit re-reads every tick, so the Advanced menu's change applies from the next slot.
     auto next_flip = std::chrono::steady_clock::now();
     std::printf("VideoOut: vblank %u Hz, frame limit %u FPS\n",
-                EmulatorSettings.GetVblankFrequency(), frame_limit);
+                EmulatorSettings.GetVblankFrequency(), EmulatorSettings.GetFrameLimit());
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -604,10 +602,6 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return {};
     };
 
-    // bbport: with a frame limit (uncapped presets) a queued flip is presented as soon as it
-    // arrives and its slot allows, between vblanks, instead of on the next vblank tick.
-    const bool immediate_flips = frame_limit != 0;
-
     while (!token.stop_requested()) {
         timer.Start();
         const auto tick_deadline = std::chrono::steady_clock::now() + vblank_period;
@@ -617,6 +611,14 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             timer.End();
             continue;
         }
+
+        // bbport: the frame limit re-reads every tick (the Advanced menu edits it live); with
+        // a limit a queued flip is presented as soon as its slot allows, between vblanks.
+        const u32 frame_limit = EmulatorSettings.GetFrameLimit();
+        const auto frame_period = frame_limit
+                                      ? std::chrono::nanoseconds(1000000000 / frame_limit)
+                                      : std::chrono::nanoseconds(0);
+        const bool immediate_flips = frame_limit != 0;
 
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;

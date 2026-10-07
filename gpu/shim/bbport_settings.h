@@ -100,9 +100,27 @@ struct Values {
     std::atomic<int> post_sharpen{0};    ///< RCAS strength after upscaling, percent
     std::atomic<int> post_defog{0};      ///< uniform haze removal (black-point pull), percent
     std::atomic<int> post_contrast{0};   ///< contrast around mid-grey, percent (100% = x1.30)
-    std::atomic<int> post_saturation{0}; ///< saturation over Rec.709 luma, percent (100% = x1.40)
+    std::atomic<int> post_saturation{0}; ///< saturation over Rec.709 luma, percent (100% = x1.40, -100% = x0.60)
     std::atomic<int> post_range{12};     ///< deband sample radius, pixels 4..32
     std::atomic<bool> post_split{false}; ///< debug: left half of pass 1 stays untouched
+    /// Colour grade, pass 1 (ASC CDL + ReShade-style vibrance and levels), percent
+    /// strengths, 0 = neutral; hot-applied every frame.
+    std::atomic<int> post_vibrance{0}; ///< luma-weighted saturation along Rec.709 luma
+    std::atomic<int> post_lift_r{0}, post_lift_g{0}, post_lift_b{0};    ///< CDL offset
+    std::atomic<int> post_gamma_r{0}, post_gamma_g{0}, post_gamma_b{0}; ///< CDL power
+    std::atomic<int> post_gain_r{0}, post_gain_g{0}, post_gain_b{0};    ///< CDL slope
+    std::atomic<int> post_levels_black{0}, post_levels_white{0};        ///< input black/white
+    std::atomic<int> post_grain{0};      ///< film grain, percent (SweetFX/TLOU look), 0 = off
+    std::atomic<bool> post_mono{false};  ///< Rec.709 mono before the grain
+    /// Advanced: 0 = start-time choice (BB_FPS_LIMIT / display cap), -1 = off, >0 FPS.
+    std::atomic<int> fps_cap{0};
+    /// GC: sync write-backs per pass (0 = unlimited) and a forced device budget in MiB
+    /// (0 = the driver's live budget); hot-applied. BB_GC_DOWNLOADS_PER_PASS /
+    /// BB_GC_BUDGET_MB seed these at start.
+    std::atomic<int> gc_writeback{6};
+    std::atomic<int> gc_budget_mb{0};
+    /// Face-button swap bitmask (1 A/B, 2 X/Y, 3 both), hot-applied; BB_PAD_SWAP overrides.
+    std::atomic<int> pad_swap{0};
     /// NGX DLSS model preset override: -1 driver default, 0 default, 10..13 = J..M.
     std::atomic<int> dlss_preset{-1};
     /// Live resolution and preset changes (run.sh): 0 off by default (startup patch, fastest

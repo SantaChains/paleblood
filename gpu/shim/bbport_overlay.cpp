@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_overlay.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -11,6 +12,7 @@
 #include <SDL3/SDL.h>
 #include "bbport_settings.h"
 #include "imgui.h"
+#include "imgui_internal.h" // ImGuiContext::ErrorCallback
 #include "imgui_impl_vulkan.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -65,11 +67,15 @@ namespace BbOverlay {
 namespace {
 
 std::mutex imgui_mutex; // the ImGui context: window thread (input) and present thread
-bool initialized = false;
+std::atomic<bool> initialized{false};
 std::atomic<bool> menu_open{false};
 bool l3_down = false, r3_down = false;
 bool dirty = false; // settings changed while open: saved on close
 float base_scale = 1.0f;
+
+// The Vulkan backend: kept so a swapchain format change (HDR toggle) can rebuild it.
+ImGui_ImplVulkan_InitInfo backend_info{};
+VkFormat backend_format = VK_FORMAT_UNDEFINED; // points into PipelineRenderingCreateInfo
 
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
@@ -77,6 +83,9 @@ float frame_ms_avg = 0.0f;
 float frame_ms_max = 0.0f; // recent worst frame, decays so spikes age out
 // Driver-measured frame latency (VK_NV_low_latency2); negative while unavailable.
 std::atomic<float> latency_ms{-1.0f};
+
+// Texture-cache GC telemetry fed by the presenter (the present thread both feeds and draws).
+GcSnapshot gc_stats{};
 
 const char* UpscalerLabel(int upscaler) {
     switch (upscaler) {
@@ -94,9 +103,12 @@ void SetOpen(bool value) {
         return;
     }
     ImGui::GetIO().MouseDrawCursor = value;
-    if (!value && dirty) {
-        dirty = false;
-        BbSettings::Save();
+    if (!value) {
+        ImGui::GetIO().ClearInputKeys(); // no nav keys stuck down across open/close cycles
+        if (dirty) {
+            dirty = false;
+            BbSettings::Save();
+        }
     }
 }
 
@@ -185,10 +197,10 @@ void Hint(const char* text) {
     }
 }
 
-enum Page { PageGraphics, PageDisplay, PageEffects, PageCheats, PageCount };
+enum Page { PageGraphics, PageDisplay, PageEffects, PageCheats, PageAdvanced, PageCount };
 
 const char* PageName(int page) {
-    static const char* names[PageCount] = {"画面", "显示", "游戏效果", "作弊"};
+    static const char* names[PageCount] = {"画面", "显示", "游戏效果", "作弊", "高级"};
     return names[page];
 }
 
@@ -347,14 +359,16 @@ void GraphicsPage() {
         Hint("原生抗锯齿：超分算法只作抗锯齿用。其他档位按输出分辨率等比降低场景渲染分辨率。"
              "UI 以输出分辨率绘制。档位从下一帧起生效，无需重启游戏。");
     }
-    Checkbox("锐化（RCAS）", s.sharpen);
-    ImGui::BeginDisabled(!s.sharpen);
-    Slider("锐化强度", s.sharpness, 0.0f, 2.0f);
-    Hint("1 以内：超分自带的锐化（RCAS）。1 以上会追加一次 RCAS。DLSS 自身无锐化："
-         "由 RCAS 一并完成。Ctrl+点击滑杆可输入精确值。");
-    ImGui::EndDisabled();
-    Checkbox("亚像素抖动", s.jitter);
-    Hint("每帧场景偏移不到一个像素，超分从多帧聚合更多细节。关闭后只剩基于历史帧的抗锯齿。");
+    if (ImGui::CollapsingHeader("超分增强", ImGuiTreeNodeFlags_DefaultOpen)) {
+        Checkbox("锐化（RCAS）", s.sharpen);
+        ImGui::BeginDisabled(!s.sharpen);
+        Slider("锐化强度", s.sharpness, 0.0f, 2.0f);
+        Hint("1 以内：超分自带的锐化（RCAS）。1 以上会追加一次 RCAS。DLSS 自身无锐化："
+             "由 RCAS 一并完成。Ctrl+点击滑杆可输入精确值。");
+        ImGui::EndDisabled();
+        Checkbox("亚像素抖动", s.jitter);
+        Hint("每帧场景偏移不到一个像素，超分从多帧聚合更多细节。关闭后只剩基于历史帧的抗锯齿。");
+    }
 
     if (ImGui::CollapsingHeader("响应式遮罩与运动矢量")) {
         ImGui::BeginDisabled(taa);
@@ -516,7 +530,65 @@ void EffectsPage() {
         }
         ImGui::EndCombo();
     }
-    if (ImGui::CollapsingHeader("后处理（去色带 / 去雾 / 暗部 / 对比 / 饱和 / 锐化）")) {
+    if (ImGui::CollapsingHeader("后处理（去色带 / 调色 / 锐化）")) {
+        {
+            // One-click looks: they only move the colour-grade sliders below (shadow, contrast,
+            // saturation, vibrance, CDL, levels, grain, mono); deband/defog/sharpen stay put.
+            struct StylePreset {
+                const char* name;
+                int shadow, contrast, sat, vib;
+                int lr, lg, lb, gr, gg, gb, sr, sg, sb, lbk, lwh, grain;
+                bool mono;
+            };
+            static constexpr StylePreset presets[] = {
+                {"原味", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false},
+                {"胶片印象", 10, 5, -8, 0, 4, 4, 8, 0, 0, 0, 0, 0, 0, 6, 0, 30, false},
+                {"冷蓝夜曲", 6, 0, -15, 0, 0, 2, 10, -6, 0, 0, 2, 0, 6, 0, 0, 15, false},
+                {"暖褐怀旧", 8, 6, -25, 10, 6, 3, -2, 0, 0, 0, 5, 2, -4, 0, 0, 20, false},
+                {"黑白惊悚", 5, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 35, true},
+            };
+            int current = -1;
+            for (int i = 0; i < 5; ++i) {
+                const auto& p = presets[i];
+                if (s.post_shadow == p.shadow && s.post_contrast == p.contrast &&
+                    s.post_saturation == p.sat && s.post_vibrance == p.vib &&
+                    s.post_lift_r == p.lr && s.post_lift_g == p.lg && s.post_lift_b == p.lb &&
+                    s.post_gamma_r == p.gr && s.post_gamma_g == p.gg &&
+                    s.post_gamma_b == p.gb && s.post_gain_r == p.sr &&
+                    s.post_gain_g == p.sg && s.post_gain_b == p.sb &&
+                    s.post_levels_black == p.lbk && s.post_levels_white == p.lwh &&
+                    s.post_grain == p.grain && s.post_mono == p.mono) {
+                    current = i;
+                }
+            }
+            if (ImGui::BeginCombo("风格预设", current >= 0 ? presets[current].name : "自定义")) {
+                for (int i = 0; i < 5; ++i) {
+                    if (ImGui::Selectable(presets[i].name, i == current)) {
+                        const auto& p = presets[i];
+                        Store(s.post_shadow, p.shadow, true);
+                        Store(s.post_contrast, p.contrast, true);
+                        Store(s.post_saturation, p.sat, true);
+                        Store(s.post_vibrance, p.vib, true);
+                        Store(s.post_lift_r, p.lr, true);
+                        Store(s.post_lift_g, p.lg, true);
+                        Store(s.post_lift_b, p.lb, true);
+                        Store(s.post_gamma_r, p.gr, true);
+                        Store(s.post_gamma_g, p.gg, true);
+                        Store(s.post_gamma_b, p.gb, true);
+                        Store(s.post_gain_r, p.sr, true);
+                        Store(s.post_gain_g, p.sg, true);
+                        Store(s.post_gain_b, p.sb, true);
+                        Store(s.post_levels_black, p.lbk, true);
+                        Store(s.post_levels_white, p.lwh, true);
+                        Store(s.post_grain, p.grain, true);
+                        Store(s.post_mono, p.mono, true);
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            Hint("一键套用调色：只动下面的调色滑杆（暗部、对比、饱和、智能饱和、三级调色、黑白场、"
+                 "颗粒、单色），去色带、去雾与锐化不受影响；滑杆改动后显示为自定义。");
+        }
         {
             int v = s.post_deband;
             Hint("去色带：天空、雾与暗部的 8-bit 分层感。mpv/libplacebo 同款算法，0 关闭，"
@@ -554,9 +626,9 @@ void EffectsPage() {
         }
         {
             int v = s.post_saturation;
-            Hint("饱和度：离开 Rec.709 亮度轴拉高彩度（100% 约为 1.4 倍），0 不生效。"
-                 "游戏本身偏浓艳，建议从 10 到 30 起步。");
-            const bool changed = ImGui::SliderInt("饱和度", &v, 0, 100, "%d%%");
+            Hint("饱和度：离开 Rec.709 亮度轴调整彩度（100% 约为 1.4 倍，-100% 约 0.6 倍），"
+                 "0 不生效。游戏本身偏浓艳，建议从 10 到 30 起步，负值做低饱和的胶片感。");
+            const bool changed = ImGui::SliderInt("饱和度", &v, -100, 100, "%d%%");
             Store(s.post_saturation, v, changed);
         }
         {
@@ -568,18 +640,151 @@ void EffectsPage() {
         Checkbox("分割对比（左半原帧）", s.post_split);
         Hint("排查用：左半屏保留未处理的原始画面，右半屏走后处理链，用于逐项核对"
              "色彩与算法偏差。");
+        if (ImGui::CollapsingHeader("智能饱和（Vibrance）")) {
+            int v = s.post_vibrance;
+            Hint("ReShade Vibrance 同款：沿亮度轴拉高彩度，越不饱和的像素加得越多，肤色附近"
+                 "有保护罩，防止人脸过饱和。0 关闭。");
+            const bool changed = ImGui::SliderInt("智能饱和", &v, 0, 100, "%d%%");
+            Store(s.post_vibrance, v, changed);
+        }
+        if (ImGui::CollapsingHeader("三级调色（Lift / Gamma / Gain）")) {
+            Hint("ASC CDL（ReShade Lift_Gamma_Gain 同源数学）：增益乘高光、提升垫阴影"
+                 "（100% = ±0.20 黑位）、伽马幂调中间调（+ 变亮）。各通道独立可做分离"
+                 "色调，0 为中性。");
+            {
+                int r = s.post_lift_r, g = s.post_lift_g, b = s.post_lift_b;
+                const bool cr = ImGui::SliderInt("提升 R", &r, -100, 100);
+                const bool cg = ImGui::SliderInt("提升 G", &g, -100, 100);
+                const bool cb = ImGui::SliderInt("提升 B", &b, -100, 100);
+                Store(s.post_lift_r, r, cr);
+                Store(s.post_lift_g, g, cg);
+                Store(s.post_lift_b, b, cb);
+            }
+            {
+                int r = s.post_gamma_r, g = s.post_gamma_g, b = s.post_gamma_b;
+                const bool cr = ImGui::SliderInt("伽马 R", &r, -100, 100);
+                const bool cg = ImGui::SliderInt("伽马 G", &g, -100, 100);
+                const bool cb = ImGui::SliderInt("伽马 B", &b, -100, 100);
+                Store(s.post_gamma_r, r, cr);
+                Store(s.post_gamma_g, g, cg);
+                Store(s.post_gamma_b, b, cb);
+            }
+            {
+                int r = s.post_gain_r, g = s.post_gain_g, b = s.post_gain_b;
+                const bool cr = ImGui::SliderInt("增益 R", &r, -100, 100);
+                const bool cg = ImGui::SliderInt("增益 G", &g, -100, 100);
+                const bool cb = ImGui::SliderInt("增益 B", &b, -100, 100);
+                Store(s.post_gain_r, r, cr);
+                Store(s.post_gain_g, g, cg);
+                Store(s.post_gain_b, b, cb);
+            }
+        }
+        if (ImGui::CollapsingHeader("黑白场（Levels）")) {
+            int v = s.post_levels_black;
+            Hint("输入黑点：低于该亮度的像素压到纯黑，100% 约为 1/2 亮度。收紧黑位、"
+                 "提对比的第一手段，0 不动。");
+            const bool changed = ImGui::SliderInt("黑场", &v, 0, 100, "%d%%");
+            Store(s.post_levels_black, v, changed);
+            v = s.post_levels_white;
+            Hint("输入白点：高于该亮度的像素推到纯白，100% 约为 1/2 亮度。黑场白场共同决定"
+                 "输入范围，收得过窄会硬切画面细节。");
+            const bool changed2 = ImGui::SliderInt("白场", &v, 0, 100, "%d%%");
+            Store(s.post_levels_white, v, changed2);
+        }
+        {
+            int v = s.post_grain;
+            Hint("胶片颗粒：乘性高斯噪声（SweetFX FilmGrain 同源数学），暗部更重、黑点不动，"
+                 "最后生还者式的低光颗粒感。与去色带的抖动共用随机流，不额外采样。");
+            const bool changed = ImGui::SliderInt("胶片颗粒", &v, 0, 100, "%d%%");
+            Store(s.post_grain, v, changed);
+        }
+        Checkbox("单色（黑白）", s.post_mono);
+        Hint("按 Rec.709 亮度去色，配合颗粒与对比即高对比黑白胶片。");
     }
-    for (int e = 0; e < BbSettings::EffectCount; ++e) {
-        Checkbox(BbSettings::Effects[e].label, s.effects[e]);
+    if (ImGui::CollapsingHeader("游戏效果开关", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (int e = 0; e < BbSettings::EffectCount; ++e) {
+            Checkbox(BbSettings::Effects[e].label, s.effects[e]);
+        }
+        Hint("效果由启动时的游戏补丁开关（patches/Bloodborne.xml）。运动模糊和动态光源阴影占用 "
+             "可观的 GPU 时间。");
+        Hint("自由视角：按住叉键再按 L3（键盘：Space + Z）。调试菜单：左侧触控板 / Tab。"
+             "需要 Nexus mod #253 的 DbgFont14h.ccm 和 DbgFont14h.tpf 放入 dvdroot_ps4/font。"
+             "右侧触控板：退格。");
     }
-    Hint("效果由启动时的游戏补丁开关（patches/Bloodborne.xml）。运动模糊和动态光源阴影占用 "
-         "可观的 GPU 时间。");
-    Hint("自由视角：按住叉键再按 L3（键盘：Space + Z）。调试菜单：左侧触控板 / Tab。"
-         "需要 Nexus mod #253 的 DbgFont14h.ccm 和 DbgFont14h.tpf 放入 dvdroot_ps4/font。"
-         "右侧触控板：退格。");
     RestartNotice();
 }
 
+void AdvancedPage() {
+    auto& s = BbSettings::Get();
+    // Frame rate cap: 0 the start-time choice, -1 off, >0 a fixed FPS.
+    static const char* caps[] = {"自动（启动配置）", "不限", "30", "45", "60", "90", "120", "144",
+                                 "165"};
+    static constexpr int cap_values[] = {0, -1, 30, 45, 60, 90, 120, 144, 165};
+    const int cap = s.fps_cap.load();
+    char cap_label[64];
+    const char* found = nullptr;
+    int cap_index = 0;
+    for (int i = 0; i < 9; ++i) {
+        if (cap_values[i] == cap) {
+            found = caps[i];
+            cap_index = i;
+        }
+    }
+    if (found) {
+        std::snprintf(cap_label, sizeof(cap_label), "%s", found);
+    } else {
+        std::snprintf(cap_label, sizeof(cap_label), "自定义 (%d)", cap);
+    }
+    if (ImGui::BeginCombo("帧率上限", cap_label)) {
+        for (int i = 0; i < 9; ++i) {
+            if (ImGui::Selectable(caps[i], i == cap_index)) {
+                Store(s.fps_cap, cap_values[i], true);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    Hint("自动沿用启动配置（BB_FPS_LIMIT，或显示器刷新率与 120 的较小值，因为更高时游戏的"
+         "移动计时会走慢）。高于游戏内部节拍的上限以游戏节拍为准。立即生效。");
+    {
+        int v = s.gc_writeback.load();
+        const bool changed =
+            ImGui::SliderInt("GC 每轮写回上限", &v, 0, 64, v ? "%d 次" : "0（不限）");
+        Store(s.gc_writeback, v, changed);
+    }
+    Hint("显存吃紧时每轮垃圾回收允许的同步写回（纹理落回 CPU）次数，默认 6，接近临界时会自动"
+         "放宽到 4 倍。调高减少卡顿、抬高显存峰值，0 完全不限制。立即生效。");
+    {
+        int v = s.gc_budget_mb.load();
+        const bool changed =
+            ImGui::SliderInt("GC 显存预算 (MiB)", &v, 0, 16384, v ? "%d MiB" : "0（自动）");
+        Store(s.gc_budget_mb, v, changed);
+    }
+    Hint("显存使用超过预算的 70% 开始回收、85% 加压、95% 激进。0 按驱动实时预算（集成 GPU 恒"
+         "为驱动值）。立即生效。");
+    static const char* swaps[] = {"关闭", "A/B（叉 ↔ 圆）", "X/Y（方 ↔ 三角）", "A/B 与 X/Y"};
+    const int swap = s.pad_swap.load();
+    if (ImGui::BeginCombo("手柄按键交换", swaps[swap])) {
+        for (int i = 0; i < 4; ++i) {
+            if (ImGui::Selectable(swaps[i], i == swap)) {
+                Store(s.pad_swap, i, true);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    Hint("任天堂布局手柄选最后一项，立即生效。BB_PAD_SWAP 可在启动时预设同样的值。");
+    if (ImGui::CollapsingHeader("资源调度（纹理缓存）")) {
+        ImGui::Text("显存用量 %llu MiB（加压线 %llu / 临界线 %llu MiB）",
+                    (unsigned long long)(gc_stats.used_memory >> 20),
+                    (unsigned long long)(gc_stats.pressure_memory >> 20),
+                    (unsigned long long)(gc_stats.critical_memory >> 20));
+        ImGui::Text("上轮回收：逐出 %llu 张，写回 %llu 张",
+                    (unsigned long long)gc_stats.evictions,
+                    (unsigned long long)gc_stats.downloads);
+        Hint("显存用量越过预算 70% 开始回收，85% 加压、95% 激进；写回指 GPU 改过的纹理在"
+             "逐出前落回 CPU 内存。计数自上次压力报告起累计，约 5 秒一轮。");
+    }
+}
+
 void CheatsPage() {
     static const char* cheat_error = nullptr;
     if (const int cheat_files = bbcheats_file_count()) {
@@ -678,6 +883,12 @@ void Menu() {
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem(PageName(PageAdvanced))) {
+            ImGui::BeginChild("##pg4", ImVec2(0.0f, -footer));
+            AdvancedPage();
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
     }
 
@@ -738,6 +949,10 @@ void SetLatencyMs(float ms) {
     latency_ms = ms;
 }
 
+void SetGcStats(const GcSnapshot& stats) {
+    gc_stats = stats;
+}
+
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
     std::scoped_lock lock{imgui_mutex};
     if (initialized) {
@@ -750,6 +965,12 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
     io.BackendPlatformName = "bbport";
+    // Recoverable errors: log and keep running (NDEBUG builds silence IM_ASSERT entirely).
+    io.ConfigErrorRecoveryEnableAssert = false;
+    io.ConfigErrorRecoveryEnableTooltip = false;
+    ImGui::GetCurrentContext()->ErrorCallback = [](ImGuiContext*, void*, const char* msg) {
+        std::printf("Overlay: ImGui error: %s\n", msg);
+    };
 
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
@@ -763,11 +984,21 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(bb_font_ttf),
                                    int(bb_font_ttf_end - bb_font_ttf), 18.0f, &font_config);
 #ifdef _WIN32
-    // The embedded face has no CJK glyphs: merge the system's YaHei UI for the Chinese menu.
-    ImFontConfig cjk_config;
-    cjk_config.MergeMode = true;
-    io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", 17.0f, &cjk_config,
-                                 io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+    // The embedded face has no CJK glyphs: merge a system CJK face for the Chinese menu.
+    bool cjk_merged = false;
+    for (const char* path :
+         {"C:\\Windows\\Fonts\\msyh.ttc", "C:\\Windows\\Fonts\\simhei.ttf",
+          "C:\\Windows\\Fonts\\Deng.ttf"}) {
+        ImFontConfig cjk_config;
+        cjk_config.MergeMode = true;
+        if (io.Fonts->AddFontFromFileTTF(path, 17.0f, &cjk_config)) {
+            cjk_merged = true;
+            break;
+        }
+    }
+    if (!cjk_merged) {
+        std::printf("Overlay: no system CJK font, Chinese menu text will show boxes\n");
+    }
 #endif
 
     const vk::Instance vk_instance = instance.GetInstance();
@@ -779,7 +1010,7 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
         },
         const_cast<vk::Instance*>(&vk_instance));
 
-    const VkFormat color_format = static_cast<VkFormat>(format);
+    backend_format = static_cast<VkFormat>(format);
     ImGui_ImplVulkan_InitInfo info{};
     info.ApiVersion = instance.ApiVersion();
     info.Instance = vk_instance;
@@ -794,15 +1025,36 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     info.PipelineInfoMain.PipelineRenderingCreateInfo = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR,
         .colorAttachmentCount = 1,
-        .pColorAttachmentFormats = &color_format,
+        .pColorAttachmentFormats = &backend_format,
+    };
+    info.CheckVkResultFn = [](VkResult err) {
+        if (err != VK_SUCCESS) {
+            std::printf("Overlay: ImGui Vulkan backend error %d\n", static_cast<int>(err));
+        }
     };
     if (!ImGui_ImplVulkan_Init(&info)) {
         std::printf("Overlay: ImGui Vulkan backend init failed\n");
         ImGui::DestroyContext();
         return;
     }
+    backend_info = info;
     initialized = true;
     std::printf("Overlay: menu ready (Insert or L3+R3)\n");
+}
+
+void OnFormatChange(vk::Format format) {
+    std::scoped_lock lock{imgui_mutex};
+    if (!initialized || static_cast<VkFormat>(format) == backend_format) {
+        return;
+    }
+    // The device was idled by Swapchain::SetHDR before this: no backend work is in flight.
+    ImGui_ImplVulkan_Shutdown();
+    backend_format = static_cast<VkFormat>(format);
+    if (!ImGui_ImplVulkan_Init(&backend_info)) {
+        initialized = false;
+        ImGui::DestroyContext();
+        std::printf("Overlay: ImGui Vulkan backend rebuild failed\n");
+    }
 }
 
 void UpdateTextInput(SDL_Window* window) {
@@ -865,6 +1117,28 @@ bool HandleEvent(const SDL_Event& event) {
         }
         if (const ImGuiKey key = KeyFromGamepad(button); key != ImGuiKey_None) {
             io.AddKeyEvent(key, down);
+        }
+        return true;
+    }
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
+        if (!is_open) {
+            return false;
+        }
+        // Left stick navigates: official imgui_impl_sdl3 semantics (8000 dead-zone,
+        // dead-zone..full scale mapped to 0..1 analog, down at >0.1).
+        if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX ||
+            event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY) {
+            const float raw = static_cast<float>(event.gaxis.value);
+            const auto analog = [](float axis, float v0, float v1) {
+                return std::clamp((axis - v0) / (v1 - v0), 0.0f, 1.0f);
+            };
+            const bool x = event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX;
+            const float a_neg = analog(raw, -8000.0f, -32768.0f);
+            const float a_pos = analog(raw, 8000.0f, 32767.0f);
+            io.AddKeyAnalogEvent(x ? ImGuiKey_GamepadLStickLeft : ImGuiKey_GamepadLStickUp,
+                                 a_neg > 0.1f, a_neg);
+            io.AddKeyAnalogEvent(x ? ImGuiKey_GamepadLStickRight : ImGuiKey_GamepadLStickDown,
+                                 a_pos > 0.1f, a_pos);
         }
         return true;
     }

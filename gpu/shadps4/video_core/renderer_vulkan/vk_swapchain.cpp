@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "bbport_overlay.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -104,8 +105,8 @@ void Swapchain::SetHDR(bool hdr) {
 
     needs_hdr = hdr;
     Recreate(width, height);
-    ImGui::Core::OnSurfaceFormatChange(needs_hdr ? SURFACE_FORMAT_HDR.format
-                                                 : surface_format.format);
+    BbOverlay::OnFormatChange(needs_hdr ? SURFACE_FORMAT_HDR.format
+                                        : surface_format.format);
 }
 
 bool Swapchain::AcquireNextImage() {

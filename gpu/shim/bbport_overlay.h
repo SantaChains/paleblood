@@ -20,6 +20,10 @@ namespace BbOverlay {
 /// Present thread, once: the ImGui context and its Vulkan backend.
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count);
 
+/// Swap thread, after the device was idled for a format change (HDR toggle):
+/// rebuilds the backend's pipeline for the new swapchain format.
+void OnFormatChange(vk::Format format);
+
 /// Window thread, for every SDL event: true when the menu consumed it.
 bool HandleEvent(const SDL_Event& event);
 /// Turns SDL text input on while the menu edits a value (window thread, once per poll).
@@ -36,5 +40,17 @@ bool CapturesInput();
 
 /// The presenter feeds the driver-measured latency (VK_NV_low_latency2); negative hides it.
 void SetLatencyMs(float ms);
+
+/// Texture-cache GC telemetry for the Advanced menu (fed by the presenter each frame).
+struct GcSnapshot {
+    u64 used_memory;     ///< live device memory estimate, bytes
+    u64 pressure_memory; ///< 85% budget mark, bytes
+    u64 critical_memory; ///< 95% budget mark, bytes
+    u64 evictions;       ///< images evicted since the last report
+    u64 downloads;       ///< dirty images written back since the last report
+};
+
+/// The presenter feeds the texture cache's GC telemetry (present thread, once per frame).
+void SetGcStats(const GcSnapshot& stats);
 
 } // namespace BbOverlay

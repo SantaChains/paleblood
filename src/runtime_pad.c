@@ -88,17 +88,17 @@ static SDL_Gamepad *current_gamepad(void) {
     }
     return gamepad;
 }
-/* BB_PAD_SWAP is a bitmask: 1 swaps A/B (south<->east), 2 swaps X/Y (west<->north), 3 swaps
- * both (Nintendo-layout pads, e.g. Flydigi in Switch mode, need the full rotation). */
+/* Face-button swap bitmask: 1 swaps A/B (south<->east), 2 swaps X/Y (west<->north), 3 swaps
+ * both (Nintendo-layout pads, e.g. Flydigi in Switch mode, need the full rotation). Set from
+ * the menu (bbport.ini pad_swap=; BB_PAD_SWAP seeds it at start) and applies immediately. */
 static int pad_swap_mask(void) {
-    static int mask, checked;
-    if (!checked) {
-        const char *v=getenv("BB_PAD_SWAP");
-        mask=v && *v ? atoi(v)&3 : 0;
-        if (mask==1) puts("Runtime: pad A/B swapped (BB_PAD_SWAP=1)");
-        else if (mask==2) puts("Runtime: pad X/Y swapped (BB_PAD_SWAP=2)");
-        else if (mask==3) puts("Runtime: pad face buttons swapped A/B and X/Y (BB_PAD_SWAP=3)");
-        checked=1;
+    static int printed;
+    const int mask=bbgpu_pad_swap_mask();
+    if (!printed) {
+        printed=1;
+        if (mask==1) puts("Runtime: pad A/B swapped");
+        else if (mask==2) puts("Runtime: pad X/Y swapped");
+        else if (mask==3) puts("Runtime: pad face buttons swapped A/B and X/Y");
     }
     return mask;
 }

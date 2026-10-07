@@ -324,6 +324,10 @@ u32 ConsumeWithOverlaysScreenshotRequests() { return 0; }
 ScreenshotRequests ConsumeScreenshotRequests() { return {}; }
 } // namespace VideoCore
 
+extern "C" int bbgpu_pad_swap_mask(void) {
+    const int v = BbSettings::Get().pad_swap.load();
+    return v < 0 ? 0 : v > 3 ? 3 : v;
+}
 extern "C" int bbgpu_overlay_captures_input(void) {
     return BbOverlay::CapturesInput() ? 1 : 0;
 }

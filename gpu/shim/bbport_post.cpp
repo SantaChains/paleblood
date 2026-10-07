@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_post.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 
@@ -23,10 +24,16 @@ struct DebandPush {
     float defog;
     float contrast;
     float saturation;
+    float vibrance;
+    float lift_r, lift_g, lift_b;    // ASC CDL offset
+    float gamma_r, gamma_g, gamma_b; // ASC CDL power (applied as 1/g)
+    float gain_r, gain_g, gain_b;    // ASC CDL slope
+    float levels_black, levels_white;
+    float grain, mono;
     u32 seed;
     u32 split;
 };
-static_assert(sizeof(DebandPush) == 40);
+static_assert(sizeof(DebandPush) == 96);
 struct SharpenPush {
     float size[2];
     float amount;
@@ -41,8 +48,25 @@ constexpr float LiftScale = 0.30f;
 constexpr float DefogScale = 0.25f;
 // Contrast at 100%: mid-grey pivots in place, blacks/whites stretch by 1.3x.
 constexpr float ContrastScale = 0.30f;
-// Saturation at 100%: 1.4x away from Rec.709 luma.
+// Saturation at 100%: 1.4x away from Rec.709 luma (-100% pulls to 0.6x).
 constexpr float SaturationScale = 0.40f;
+// Film grain at 100%: multiplicative gaussian (sigma ~0.7 via Box-Muller) weighted by squared
+// inverse luma, so it lives in the shadows and black stays black — SweetFX/TLOU amplitude.
+constexpr float GrainScale = 0.12f;
+
+// Colour grade scalings (percent slider -> shader value). Vibrance is ReShade's own scale;
+// the CDL trio (ReShade's Lift/Gamma/Gain): lift +-0.20 pedestal, gamma power 0.1..2 applied
+// as 1/g so plus brightens, gain slope 0.5..1.5. Levels pull the input black/white in by up
+// to half the range; the white point stays 0.05 above the black one.
+float LggLift(int v) {
+    return float(v) * 0.002f;
+}
+float LggGamma(int v) {
+    return std::max(1.0f + float(v) * 0.01f, 0.1f);
+}
+float LggGain(int v) {
+    return 1.0f + float(v) * 0.005f;
+}
 
 const Vulkan::Instance* instance = nullptr;
 vk::Image mid_image{}, out_image{};
@@ -218,11 +242,22 @@ vk::ImageMemoryBarrier MakeEntryBarrier(vk::Image image, bool defined, vk::Image
     };
 }
 
+/// Any pass-1 colour work beyond deband: the grade trio (vibrance, ASC CDL, levels), film
+/// grain and mono.
+bool Grading() {
+    const auto& s = BbSettings::Get();
+    const bool lgg = s.post_lift_r.load() || s.post_lift_g.load() || s.post_lift_b.load() ||
+                     s.post_gamma_r.load() || s.post_gamma_g.load() || s.post_gamma_b.load() ||
+                     s.post_gain_r.load() || s.post_gain_g.load() || s.post_gain_b.load();
+    return s.post_vibrance.load() > 0 || lgg || s.post_levels_black.load() > 0 ||
+           s.post_levels_white.load() > 0 || s.post_grain.load() > 0 || s.post_mono.load();
+}
+
 bool Active() {
     const auto& s = BbSettings::Get();
     return s.post_deband.load() > 0 || s.post_shadow.load() > 0 || s.post_sharpen.load() > 0 ||
            s.post_defog.load() > 0 || s.post_contrast.load() > 0 || s.post_saturation.load() > 0 ||
-           s.post_split.load();
+           Grading() || s.post_split.load();
 }
 
 } // namespace
@@ -271,7 +306,7 @@ void Record(vk::CommandBuffer cmdbuf, vk::ImageView src_view, u32 w, u32 h) {
     const auto& s = BbSettings::Get();
     const bool pass1_on = s.post_deband.load() > 0 || s.post_shadow.load() > 0 ||
                           s.post_defog.load() > 0 || s.post_contrast.load() > 0 ||
-                          s.post_saturation.load() > 0 || s.post_split.load();
+                          s.post_saturation.load() > 0 || Grading() || s.post_split.load();
     const bool sharpen_on = s.post_sharpen.load() > 0;
     const u32 seed = ++frame_seed;
 
@@ -300,6 +335,7 @@ void Record(vk::CommandBuffer cmdbuf, vk::ImageView src_view, u32 w, u32 h) {
 
     vk::ImageView last_view = src_view;
     if (pass1_on) {
+        const int black = s.post_levels_black.load();
         const DebandPush push{{float(w), float(h)},
                               DebandThreshold(s.post_deband.load()),
                               float(s.post_range.load()),
@@ -307,6 +343,18 @@ void Record(vk::CommandBuffer cmdbuf, vk::ImageView src_view, u32 w, u32 h) {
                               DefogScale * float(s.post_defog.load()) / 100.0f,
                               1.0f + ContrastScale * float(s.post_contrast.load()) / 100.0f,
                               1.0f + SaturationScale * float(s.post_saturation.load()) / 100.0f,
+                              float(s.post_vibrance.load()) / 100.0f,
+                              LggLift(s.post_lift_r.load()), LggLift(s.post_lift_g.load()),
+                              LggLift(s.post_lift_b.load()),
+                              LggGamma(s.post_gamma_r.load()), LggGamma(s.post_gamma_g.load()),
+                              LggGamma(s.post_gamma_b.load()),
+                              LggGain(s.post_gain_r.load()), LggGain(s.post_gain_g.load()),
+                              LggGain(s.post_gain_b.load()),
+                              float(black) * 0.005f,
+                              std::max(1.0f - float(s.post_levels_white.load()) * 0.005f,
+                                       float(black) * 0.005f + 0.05f),
+                              GrainScale * float(s.post_grain.load()) / 100.0f,
+                              s.post_mono.load() ? 1.0f : 0.0f,
                               seed,
                               s.post_split.load() ? 1u : 0u};
         Dispatch(cmdbuf, *deband_pipeline, last_view, mid_view, &push, sizeof(push));

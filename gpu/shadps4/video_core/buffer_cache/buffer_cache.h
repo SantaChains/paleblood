@@ -28,6 +28,7 @@ class GraphicsPipeline;
 struct SubmitInfo;
 class Runtime;
 class StagingBufferPool;
+struct StagingBufferRef;
 } // namespace Vulkan
 
 namespace VideoCore {
@@ -111,11 +112,12 @@ public:
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
-    /// bbport: synchronously writes a GPU-modified image back to guest memory: downloads
-    /// the image, runs the tiling compute into an arena, submits, then copies the tiled
-    /// bytes to the guest through the backing view. Eviction-safe: the call returns with
-    /// no work deferred past the image (and its page protection) being freed.
-    void WriteBackImageToGuest(Image& image);
+    /// bbport: recorded half of a GPU-modified image's write-back to guest memory: downloads
+    /// the image, runs the tiling compute into an arena and records an arena -> staging copy,
+    /// all without waiting (a null `download.buffer` means nothing to land). The caller
+    /// flushes, then copies the staged tiled bytes to the guest through the backing view
+    /// before the image (and its page protection) is freed: eviction-safe, nothing deferred.
+    void BeginWriteBackImageToGuest(Image& image, Vulkan::StagingBufferRef& download);
 
 private:
     struct ArenaBinds {

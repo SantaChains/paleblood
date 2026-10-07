@@ -112,11 +112,47 @@ void Set(Values& v, const std::string& key, const std::string& value) {
     } else if (key == "post_contrast") {
         v.post_contrast = std::clamp(i, 0, 100);
     } else if (key == "post_saturation") {
-        v.post_saturation = std::clamp(i, 0, 100);
+        v.post_saturation = std::clamp(i, -100, 100);
     } else if (key == "post_range") {
         v.post_range = std::clamp(i, 4, 32);
     } else if (key == "post_split") {
         v.post_split = i != 0;
+    } else if (key == "post_vibrance") {
+        v.post_vibrance = std::clamp(i, 0, 100);
+    } else if (key == "post_lift_r") {
+        v.post_lift_r = std::clamp(i, -100, 100);
+    } else if (key == "post_lift_g") {
+        v.post_lift_g = std::clamp(i, -100, 100);
+    } else if (key == "post_lift_b") {
+        v.post_lift_b = std::clamp(i, -100, 100);
+    } else if (key == "post_gamma_r") {
+        v.post_gamma_r = std::clamp(i, -100, 100);
+    } else if (key == "post_gamma_g") {
+        v.post_gamma_g = std::clamp(i, -100, 100);
+    } else if (key == "post_gamma_b") {
+        v.post_gamma_b = std::clamp(i, -100, 100);
+    } else if (key == "post_gain_r") {
+        v.post_gain_r = std::clamp(i, -100, 100);
+    } else if (key == "post_gain_g") {
+        v.post_gain_g = std::clamp(i, -100, 100);
+    } else if (key == "post_gain_b") {
+        v.post_gain_b = std::clamp(i, -100, 100);
+    } else if (key == "post_levels_black") {
+        v.post_levels_black = std::clamp(i, 0, 100);
+    } else if (key == "post_levels_white") {
+        v.post_levels_white = std::clamp(i, 0, 100);
+    } else if (key == "post_grain") {
+        v.post_grain = std::clamp(i, 0, 100);
+    } else if (key == "post_mono") {
+        v.post_mono = i != 0;
+    } else if (key == "fps_cap") {
+        v.fps_cap = std::clamp(i, -1, 480);
+    } else if (key == "gc_writeback") {
+        v.gc_writeback = std::clamp(i, 0, 64);
+    } else if (key == "gc_budget_mb") {
+        v.gc_budget_mb = std::clamp(i, 0, 65536);
+    } else if (key == "pad_swap") {
+        v.pad_swap = std::clamp(i, 0, 3);
     } else if (key == "dlss_preset") {
         v.dlss_preset = i < 0 ? -1 : std::clamp(i, 0, 15);
     } else if (key == "output_res") {
@@ -173,6 +209,8 @@ void Load() {
         {"BB_REACTIVE_THRESHOLD", "reactive_threshold"}, {"BB_REACTIVE_MAX", "reactive_max"},
         {"BB_UPSCALE_PRESET", "preset"},            {"BB_OBJECT_MOTION", "object_motion"},
         {"BB_LOW_LATENCY", "low_latency"},
+        {"BB_PAD_SWAP", "pad_swap"},
+        {"BB_GC_DOWNLOADS_PER_PASS", "gc_writeback"}, {"BB_GC_BUDGET_MB", "gc_budget_mb"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env)) {
@@ -249,6 +287,12 @@ void Save() {
         "live_resolution",    "post_deband",        "post_shadow",    "post_sharpen",
         "post_defog",         "post_contrast",      "post_saturation",
         "post_range",         "post_split",
+        "post_vibrance",      "post_lift_r",      "post_lift_g",    "post_lift_b",
+        "post_gamma_r",       "post_gamma_g",     "post_gamma_b",
+        "post_gain_r",        "post_gain_g",      "post_gain_b",
+        "post_levels_black",  "post_levels_white",
+        "post_grain",         "post_mono",
+        "fps_cap",            "gc_writeback",     "gc_budget_mb",   "pad_swap",
         "dlss_preset",
         "fullscreen", // legacy: absorbed so old lines are not kept as foreign
     };
@@ -309,6 +353,20 @@ void Save() {
                  v.post_contrast.load(), v.post_saturation.load());
     std::fprintf(file, "post_range=%d\npost_split=%d\n", v.post_range.load(),
                  v.post_split.load() ? 1 : 0);
+    std::fprintf(file,
+                 "post_vibrance=%d\npost_lift_r=%d\npost_lift_g=%d\npost_lift_b=%d\n"
+                 "post_gamma_r=%d\npost_gamma_g=%d\npost_gamma_b=%d\n"
+                 "post_gain_r=%d\npost_gain_g=%d\npost_gain_b=%d\n"
+                 "post_levels_black=%d\npost_levels_white=%d\npost_grain=%d\npost_mono=%d\n",
+                 v.post_vibrance.load(), v.post_lift_r.load(), v.post_lift_g.load(),
+                 v.post_lift_b.load(), v.post_gamma_r.load(), v.post_gamma_g.load(),
+                 v.post_gamma_b.load(), v.post_gain_r.load(), v.post_gain_g.load(),
+                 v.post_gain_b.load(), v.post_levels_black.load(), v.post_levels_white.load(),
+                 v.post_grain.load(), v.post_mono.load() ? 1 : 0);
+    // Advanced page (all hot-applied).
+    std::fprintf(file, "fps_cap=%d\ngc_writeback=%d\ngc_budget_mb=%d\npad_swap=%d\n",
+                 v.fps_cap.load(), v.gc_writeback.load(), v.gc_budget_mb.load(),
+                 v.pad_swap.load());
     std::fprintf(file, "dlss_preset=%d\n", v.dlss_preset.load());
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"

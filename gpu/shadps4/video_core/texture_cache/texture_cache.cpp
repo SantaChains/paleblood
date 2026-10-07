@@ -3,6 +3,7 @@
 
 #include <xxhash.h>
 
+#include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -65,28 +66,45 @@ TextureCache::~TextureCache() = default;
 
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
+    if (download_images.empty()) {
+        return;
+    }
+    // bbport: one flush for the whole batch, not one per image.
+    boost::container::small_vector<PendingWriteback, 4> pending;
+    bool any = false;
     for (const ImageId image_id : download_images) {
-        DownloadImageMemory(image_id, true);
+        BeginImageDownload(image_id, pending.emplace_back(), false);
+        any |= pending.back().download.buffer != nullptr;
     }
     download_images.clear();
+    if (!any) {
+        return;
+    }
+    scheduler.Finish();
+    for (auto& w : pending) {
+        CompleteImageDownload(w);
+    }
 }
 
-void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
+void TextureCache::BeginImageDownload(ImageId image_id, PendingWriteback& out,
+                                      bool deferred_staging) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
     if (image.info.props.is_tiled) {
-        // bbport: macro-tiled guests need the tiling compute; WriteBackImageToGuest lands the
-        // tiled bytes in guest memory synchronously (nothing deferred past the call).
-        buffer_cache.WriteBackImageToGuest(image);
+        // bbport: macro-tiled guests need the tiling compute; the caller's flush runs it and
+        // the arena copy, and CompleteImageDownload lands the staged tiled bytes on the guest.
+        buffer_cache.BeginWriteBackImageToGuest(image, out.download);
+        out.guest_address = image.info.guest_address;
+        out.size = image.info.guest_size;
         return;
     }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
     const auto download =
-        runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, !sync);
+        runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, deferred_staging);
     const vk::BufferImageCopy image_download = {
         .bufferOffset = download.offset,
         .bufferRowLength = image.info.pitch,
@@ -103,19 +121,34 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
     };
     runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
+    out.download = download;
+    out.guest_address = image.info.guest_address;
+    out.size = download_size;
+}
+
+void TextureCache::CompleteImageDownload(PendingWriteback& w) {
+    if (!w.download.buffer) {
+        return;
+    }
+    w.download.Invalidate();
+    Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(w.guest_address),
+                                              w.download.mapped, w.size);
+}
+
+void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
+    PendingWriteback w;
+    BeginImageDownload(image_id, w, !sync);
+    if (!w.download.buffer) {
+        return;
+    }
     if (sync) {
         scheduler.Finish();
-        download.Invalidate();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download.mapped, download_size);
+        CompleteImageDownload(w);
     } else {
-        scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
-                download.Invalidate();
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
-                                                          download.mapped, download_size);
-                runtime.GetStagingPool().FreeDeferred(download);
-            });
+        scheduler.DeferPriorityOperation([this, w]() mutable {
+            CompleteImageDownload(w);
+            runtime.GetStagingPool().FreeDeferred(w.download);
+        });
     }
 }
 
@@ -1069,14 +1102,11 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 /// bbport: synchronous write-backs (tiling compute plus copy) allowed per GC pass under mere
 /// memory pressure. The base cap spreads the cost over submits; the effective cap scales up to
 /// 4x as usage approaches the critical mark, keeping the steady-state usage low (a driver reset
-/// under churn costs more than a hitch). 0 disables the cap entirely.
+/// under churn costs more than a hitch). 0 disables the cap entirely; the Advanced menu
+/// edits it live (BB_GC_DOWNLOADS_PER_PASS seeds it at start).
 static size_t GcDownloadsPerPass() {
-    static const size_t cap = [] {
-        const char* env = std::getenv("BB_GC_DOWNLOADS_PER_PASS");
-        const unsigned long v = env ? std::strtoul(env, nullptr, 10) : 6;
-        return v == 0 ? SIZE_MAX : size_t(v);
-    }();
-    return cap;
+    const int v = BbSettings::Get().gc_writeback.load();
+    return v > 0 ? size_t(v) : SIZE_MAX;
 }
 
 static size_t ScaledDownloadBudget(u64 used, u64 pressure, u64 critical) {
@@ -1088,6 +1118,10 @@ static size_t ScaledDownloadBudget(u64 used, u64 pressure, u64 critical) {
     return base + size_t(3.0f * base * t);
 }
 
+TextureCache::GcStats TextureCache::GetGcStats() const {
+    return gc_stats_pub.load(std::memory_order_relaxed);
+}
+
 void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
@@ -1096,11 +1130,10 @@ void TextureCache::GarbageCollectImages() {
         // ~1 GB after its 8 GB system reserve: usage stayed above the critical mark, so the
         // collector evicted images used two or three frames ago on every submission and wrote
         // GPU-written ones back. Compare with the driver's current budget instead.
-        // BB_GC_BUDGET_MB=N: this rule with a fixed budget on any GPU (tests on a desktop).
-        static const u64 forced_budget = [] {
-            const char* env = std::getenv("BB_GC_BUDGET_MB");
-            return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
-        }();
+        // BB_GC_BUDGET_MB=N (ini gc_budget_mb=, the Advanced menu): a fixed budget on any
+        // GPU (tests on a desktop), 0 = the driver's live budget.
+        const int budget_mb = BbSettings::Get().gc_budget_mb.load();
+        const u64 forced_budget = budget_mb > 0 ? u64(budget_mb) << 20 : 0;
         if (instance.IsIntegrated() || forced_budget) {
             // bbport: the driver's live budget is the authority; a forced budget beyond it
             // would only move the thresholds past what the device actually tolerates.
@@ -1114,6 +1147,9 @@ void TextureCache::GarbageCollectImages() {
             }
         }
     }
+    gc_stats_pub.store({total_used_memory, pressure_gc_memory, critical_gc_memory,
+                        gc_evictions, gc_downloads},
+                       std::memory_order_relaxed);
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
@@ -1139,15 +1175,28 @@ void TextureCache::GarbageCollectImages() {
                                                      critical_gc_memory)
                               : SIZE_MAX;
     };
+    // bbport: every victim's write-back copy is recorded while its image is still alive, all
+    // of them run under one flush at the end of the pass, and the bytes land on the guest
+    // pages before any FreeImage below. The old per-image scheduler.Finish() drained the whole
+    // pipeline once per written-back image — under Bloodborne's permanent memory pressure that
+    // was multiple full CPU-GPU syncs per second: the visible hitches.
+    boost::container::small_vector<ImageId, 64> evictions;
+    boost::container::small_vector<PendingWriteback, 16> writebacks;
+    std::unordered_set<u32> selected; // victim ids (index): FreeImage is deferred, later passes
+                                      // of this collect must not select them twice
+    u64 freed = 0; // memory of the selected images, released by the FreeImage pass below
     const auto clean_up = [&](ImageId image_id) {
         if (num_deletions == 0) {
             return true;
         }
+        if (selected.contains(image_id.index)) {
+            return false;
+        }
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         // bbport: tiled GPU-written images used to be skipped here ("can't handle non-linear
-        // image downloads"); DownloadImageMemory now routes them through the arena tiling
-        // compute, so eviction frees their VRAM like any other image.
+        // image downloads"); BeginImageDownload routes them through the arena tiling compute,
+        // so eviction frees their VRAM like any other image.
         if (download && (!pressured || download_budget == 0)) {
             // Not pressured: dirty images stay. Budget spent: defer this write-back to a later
             // submit; reaching the critical mark lifts the cap instead.
@@ -1158,21 +1207,21 @@ void TextureCache::GarbageCollectImages() {
         --num_deletions;
         if (download) {
             --download_budget;
-            // bbport: synchronously, while the image still protects its pages. A deferred
-            // write-back landed after FreeImage had unprotected them, over whatever the game
-            // had meanwhile stored there (e.g. its heap after unloading an area).
-            DownloadImageMemory(image_id, true);
+            BeginImageDownload(image_id, writebacks.emplace_back(), false);
             ++gc_downloads;
         }
         ++gc_evictions;
-        FreeImage(image_id);
-        if (total_used_memory < critical_gc_memory) {
+        evictions.push_back(image_id);
+        selected.insert(image_id.index);
+        freed += Common::AlignUp(image.info.guest_size, 1024);
+        const u64 projected = total_used_memory - freed;
+        if (projected < critical_gc_memory) {
             if (aggresive) {
                 num_deletions >>= 2;
                 aggresive = false;
                 return false;
             }
-            if (pressured && total_used_memory < pressure_gc_memory) {
+            if (pressured && projected < pressure_gc_memory) {
                 num_deletions >>= 1;
                 pressured = false;
             }
@@ -1184,7 +1233,7 @@ void TextureCache::GarbageCollectImages() {
     configure(false);
     lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 
-    if (total_used_memory >= critical_gc_memory) {
+    if (total_used_memory - freed >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
         lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
@@ -1196,12 +1245,23 @@ void TextureCache::GarbageCollectImages() {
     // of age — but never younger than 16 ticks: images bound by the just-submitted command
     // buffer are still in flight, and freeing them there is use-after-free (device-lost
     // class). GPU-written victims are written back first, tiled ones via the tiling compute.
-    if (total_used_memory >= critical_gc_memory) {
+    if (total_used_memory - freed >= critical_gc_memory) {
         pressured = true;
         num_deletions = 64;
         download_budget = SIZE_MAX;
         ticks_to_destroy = 16;
         lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    }
+    // One flush covers every write-back recorded in this pass; the bytes land while every
+    // victim's pages are still tracked, and only then are the images freed.
+    if (!writebacks.empty()) {
+        scheduler.Finish();
+        for (auto& w : writebacks) {
+            CompleteImageDownload(w);
+        }
+    }
+    for (const ImageId image_id : evictions) {
+        FreeImage(image_id);
     }
     // bbport: evictions under memory pressure, at most every 5 s (BB_FRAME_STATS or not).
     if (pressured || gc_downloads != 0) {
@@ -1217,6 +1277,9 @@ void TextureCache::GarbageCollectImages() {
             gc_evictions = gc_downloads = 0;
         }
     }
+    gc_stats_pub.store({total_used_memory, pressure_gc_memory, critical_gc_memory,
+                        gc_evictions, gc_downloads},
+                       std::memory_order_relaxed);
 }
 
 void TextureCache::GarbageCollectSamplers() {

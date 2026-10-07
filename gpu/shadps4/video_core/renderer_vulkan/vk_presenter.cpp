@@ -697,6 +697,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
         // bbport: the settings menu / FPS counter over the frame, at display resolution.
         const bool overlay = BbOverlay::Visible();
+        if (overlay) {
+            // The Advanced menu reads the texture cache's GC telemetry (present-thread feed).
+            const auto gc = texture_cache.GetGcStats();
+            BbOverlay::SetGcStats({gc.used_memory, gc.pressure_memory, gc.critical_memory,
+                                   gc.evictions, gc.downloads});
+        }
         const std::array post_barriers{
             vk::ImageMemoryBarrier{
                 .srcAccessMask = vk::AccessFlagBits::eTransferWrite,

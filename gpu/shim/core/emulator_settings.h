@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <string>
+#include "bbport_settings.h"
 #include "common/types.h"
 
 u32 BbDisplayRefreshHz(); // bbgpu.cpp: primary display refresh rate, 60 when unknown
@@ -41,8 +42,13 @@ public:
         }();
         return value;
     }
-    /// Frames per second the present thread lets through; 0 = no limit. BB_FPS_LIMIT overrides.
+    /// Frames per second the present thread lets through; 0 = no limit. BB_FPS_LIMIT
+    /// overrides the automatic choice; the menu's fps_cap (Advanced page) overrides both, hot.
     u32 GetFrameLimit() {
+        const int cap = BbSettings::Get().fps_cap.load();
+        if (cap != 0) {
+            return cap < 0 ? 0u : u32(cap);
+        }
         static const u32 value = [] {
             const long limit = Number("BB_FPS_LIMIT", -1);
             if (limit >= 0) return u32(limit);

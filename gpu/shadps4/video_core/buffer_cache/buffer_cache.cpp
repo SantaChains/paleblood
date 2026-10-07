@@ -663,13 +663,14 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     return true;
 }
 
-// bbport: synchronous write-back of a GPU-modified image for eviction. The image is
+// bbport: recorded half of a GPU-modified image's write-back for eviction. The image is
 // downloaded, the tiling compute converts it to the guest's tiled layout inside an arena, and
-// the result is copied to guest memory through the backing view — all before returning, so no
-// deferred work can land after the image (and its page protection) is gone. The game keeps
-// running meanwhile: its pages for this image are read-only while tracked, and the backing
-// write bypasses that protection without faults, exactly like the linear download path.
-void BufferCache::WriteBackImageToGuest(Image& image) {
+// an arena -> staging copy is recorded — all without waiting. The caller flushes once for the
+// whole GC pass and then lands the staged bytes on the guest pages, before any victim image
+// (and its page protection) is freed, so no deferred work can land after they are gone. The
+// game keeps running meanwhile: its pages for this image are read-only while tracked, and the
+// backing write bypasses that protection without faults, exactly like the linear download.
+void BufferCache::BeginWriteBackImageToGuest(Image& image, Vulkan::StagingBufferRef& download) {
     const VAddr device_addr = image.info.guest_address;
     const u64 size = image.info.guest_size;
     const u64 first_block = device_addr >> block_shift;
@@ -702,25 +703,21 @@ void BufferCache::WriteBackImageToGuest(Image& image) {
         });
     }
     if (buffer_copies.empty()) {
-        return;
+        return; // `download.buffer` stays null: the caller has nothing to land
     }
     texture_cache.GetTileManager().TileImage(image, buffer_copies, arena, arena_offset);
     runtime.FlushBarriers();
 
-    // Arena -> host-visible staging -> guest. Finish() runs the submit callback first, which
-    // commits the sparse binds EnsureResident queued, then executes and waits for everything
-    // recorded above, including the tiling compute.
-    const auto download = staging_pool.Request(size, MemoryType::HostCached);
+    // Arena -> host-visible staging. The caller's single Finish() runs the submit callback
+    // first, which commits the sparse binds EnsureResident queued, then executes and waits
+    // for everything recorded above, including the tiling compute.
+    download = staging_pool.Request(size, MemoryType::HostCached);
     const vk::BufferCopy copy = {
         .srcOffset = arena_offset,
         .dstOffset = download.offset,
         .size = size,
     };
     runtime.CopyBuffer(arena, download.buffer, std::span{&copy, 1});
-    scheduler.Finish();
-    download.Invalidate();
-    memory->TryWriteBacking(std::bit_cast<u8*>(device_addr),
-                            download.mapped + (copy.dstOffset - download.offset), copy.size);
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {

@@ -79,6 +79,8 @@ public:
             return;
         }
         swapchain.SetHDR(enable);
+        // The old pipeline declared the previous swapchain format: rebuild it.
+        pp_pass.Create(instance.GetDevice(), swapchain.GetSurfaceFormat().format);
         pp_settings.hdr = enable ? 1 : 0;
     }
 

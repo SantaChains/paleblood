@@ -24,6 +24,7 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/sampler.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -55,6 +56,16 @@ class TextureCache {
     using PageTable = MultiLevelPageTable<Traits>;
 
 public:
+    /// bbport: garbage-collector telemetry snapshot for the Advanced menu.
+    struct GcStats {
+        u64 used_memory = 0;
+        u64 pressure_memory = 0;
+        u64 critical_memory = 0;
+        u64 evictions = 0;
+        u64 downloads = 0;
+    };
+    [[nodiscard]] GcStats GetGcStats() const;
+
     enum class BindingType : u32 {
         Texture,
         Storage,
@@ -299,6 +310,19 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// bbport: one deferred image write-back. BeginImageDownload only records the GPU copy
+    /// (staging download for linear images, tiling compute plus arena copy for tiled ones,
+    /// null buffer when there is nothing to land); CompleteImageDownload puts the bytes on
+    /// the guest pages after the copy has executed. The GC pass records every victim first,
+    /// flushes once, completes all write-backs and only then frees the images.
+    struct PendingWriteback {
+        Vulkan::StagingBufferRef download{};
+        VAddr guest_address{};
+        u64 size{};
+    };
+    void BeginImageDownload(ImageId image_id, PendingWriteback& out, bool deferred_staging);
+    void CompleteImageDownload(PendingWriteback& w);
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
@@ -416,6 +440,7 @@ private:
     u64 total_used_memory = 0;
     u64 gc_evictions = 0, gc_downloads = 0; ///< bbport: pressure report
     std::chrono::steady_clock::time_point gc_report_time{};
+    std::atomic<GcStats> gc_stats_pub{}; ///< bbport: telemetry published for the menu
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
