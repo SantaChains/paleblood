@@ -198,6 +198,15 @@ def sweep_stale_overlays(out):
             pass
 
 
+def touch(directory):
+    """Marks a reused overlay as reached, so the day-based sweep does not collect a cache
+    that is merely old — reusing it IS the activity the grace period exists to protect."""
+    try:
+        os.utime(directory, None)
+    except OSError:
+        pass
+
+
 def fingerprint(game, mods, replacements):
     """Sha256 of everything the overlay's links point at: the game folder and its
     top-level entries, the ordered mod layers with their files (path, size, mtime)
@@ -235,17 +244,36 @@ def build_overlay(game, out, mods):
     out.mkdir(parents=True, exist_ok=True)
     # Linking thousands of mod files takes tens of seconds: reuse the overlay built for
     # exactly these inputs (its name is the fingerprint, so a hit cannot be stale).
-    cache = out / f'mod-game-{fingerprint(game, mods, replacements)}'
+    fp = fingerprint(game, mods, replacements)
+    cache = out / f'mod-game-{fp}'
     if cache.is_dir():
         print(f'Mods: reusing {cache.name}', file=sys.stderr)
+        touch(cache)
         return cache
+    # A rename can fail with the overlay finished (an antivirus holds the fresh directory for
+    # a while on Windows); the fallback then keeps the mkdtemp-named directory. Carry the
+    # fingerprint inside it so that build is still reusable instead of being redone — with
+    # thousands of files plus a real-time scanner that is minutes of work per launch.
+    for entry in Path(out).glob('mod-game-*'):
+        marker = entry / '.fingerprint'
+        try:
+            if entry.is_dir() and marker.read_text(encoding='utf-8').strip() == fp:
+                print(f'Mods: reusing {entry.name}', file=sys.stderr)
+                touch(entry)
+                return entry
+        except OSError:
+            pass
     sweep_stale_overlays(out)
     overlay = Path(tempfile.mkdtemp(prefix='mod-game-', dir=out))
     try:
         for entry in game.iterdir():
             link(overlay / entry.name, entry)
         replaced = added = 0
+        # Progress every 500 files: a silent minutes-long stretch reads as a hang.
         for relative, source, _ in replacements:
+            replaced_or_added = replaced + added
+            if replaced_or_added and replaced_or_added % 500 == 0:
+                print(f'Mods: linking {replaced_or_added}/{len(replacements)}...', file=sys.stderr)
             # Each component takes the game's spelling when it exists in another case.
             parent = overlay
             for part in relative.parts[:-1]:
@@ -265,14 +293,32 @@ def build_overlay(game, out, mods):
                 added += 1
             link(destination, source)
         print(f'Mods: {replaced} game files replaced, {added} added', file=sys.stderr)
-        try:
-            overlay.rename(cache)
-        except OSError:
+        # Windows' rename fails while any process (an antivirus scanning the fresh
+        # directory, a concurrent read) holds it; such holds are transient. Retry across
+        # a two-second window before falling back.
+        renamed = False
+        for attempt in range(10):
+            try:
+                overlay.rename(cache)
+                renamed = True
+                break
+            except OSError:
+                if cache.is_dir():
+                    break  # a concurrent launch finished the same overlay
+                time.sleep(0.2)
+        if not renamed:
             if cache.is_dir():
                 remove_overlay(overlay)  # a concurrent launch finished the same overlay
                 print(f'Mods: reusing {cache.name}', file=sys.stderr)
                 return cache
-            print(f'Mods: {overlay.name} kept (rename failed, swept in a day)', file=sys.stderr)
+            # Keep the finished overlay and carry the fingerprint inside it: the next
+            # launch finds it through the marker even though the name is not the
+            # fingerprint, so the minutes of linking are not thrown away.
+            try:
+                (overlay / '.fingerprint').write_text(fp, encoding='utf-8')
+            except OSError:
+                pass
+            print(f'Mods: {overlay.name} kept (rename failed; reusable via fingerprint)', file=sys.stderr)
             return overlay
         return cache
     except BaseException:
