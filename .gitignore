@@ -52,12 +52,13 @@ result-*
 
 # Publication hygiene: user-supplied game content, vendor binaries and Sony-owned art never enter the repo
 #
-# patches/ needs two rules, not one. Bloodborne.xml directly under it is the port's built-in
-# patch database (scripts/patches.py defaults --xml to it and refuses to start without it),
-# and its patch lists carry local corrections on top of shadps4-emu/ps4_cheats, so it must be
-# tracked. The GoldHEN/ and shadPS4/ subdirectories are unmodified third-party collections and
-# stay out. Matching "/patches/*/" rather than "/patches/" keeps both facts in one place.
-/patches/*/
+# patches/ is entirely absent from the repository, Bloodborne.xml included: it is community
+# patch data whose authors (Kyo, illusion, auser1337, emoose, ...) granted no redistribution
+# rights, and shadps4-emu/ps4_cheats carries no LICENSE (defaults to all rights reserved).
+# It is still required to start — scripts/patches.py defaults --xml to patches/Bloodborne.xml
+# and refuses to run without it — so tools/fetch_patches.sh pulls it and patches.py names the
+# file in its error when it is missing.
+/patches/
 /dumps/
 /savedata/
 /sys_modules/

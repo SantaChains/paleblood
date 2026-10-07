@@ -11,7 +11,7 @@ The `windows-port` branch is the native Windows version; it adds NVIDIA DLSS ups
 - This project is for learning and technical research only. Commercial use is prohibited.
 - The repository distributes **no game files, no game assets, no artwork, no fonts and no decryption keys**. You must supply a legally obtained dump of your own copy of *Bloodborne* (digital version, patch 1.09).
 - This project is not affiliated with Sony Interactive Entertainment or FromSoftware. *Bloodborne* and all related trademarks belong to their respective owners.
-- Community patches and cheat files are **mostly not bundled** — `patches\Bloodborne.xml` (required to start) is the sole exception; download the rest from their original authors (see *Mods and patches* below) and review their contents before enabling.
+- Community patches and cheat files are **not bundled** — `patches\Bloodborne.xml` (required to start) is the only one you must supply yourself; get it and the rest from their original authors (see *Mods and patches* below) and review their contents before enabling.
 - Use of this project is at your own risk; the authors are not responsible for any consequences.
 
 ## Status
@@ -41,7 +41,14 @@ Experimental but playable. The game boots, combat works, saving works; audio, ga
 
 ## Quick start (Windows)
 
-Option 1 — one-click setup (recommended). Double-click `setup.bat`: a window opens where you pick the game directory and settings, then Install/Update installs MSYS2 and all packages, builds, and generates `bbport.ini` plus shortcuts. No shell, no typing. Run it again any time to change settings; Save settings stores them without building.
+Option 1 — one-click setup (recommended). Double-click `setup.bat`: a window opens where you pick the game directory and settings, then Install/Update installs MSYS2 and all packages, builds, and generates `bbport.ini` plus shortcuts. Run it again any time to change settings; Save settings stores them without building.
+
+**Two things the installer does not do for you.** Do them first, or the port fails at launch with a
+"community patch database is missing" error:
+
+1. The game directory: a 1.09 dump of any region (with `eboot.bin` and `sce_module`).
+2. The community patch database `patches\Bloodborne.xml` — see *Mods and patches*. The repository
+   does not redistribute it and the copyright is not the port's to give.
 
 Option 2 — manual, three pasted commands.
 
@@ -113,8 +120,9 @@ Rules: files whose `process` is not `eboot.bin` or whose `id` mismatches the gam
 
 - Mods: each subdirectory of `mods\` is one mod, containing `dvdroot_ps4\`, a single wrapper directory, or game directories like `chr\` directly. Filenames are case-insensitive; later loads override earlier ones. To enable/disable or reorder mods, edit `mods.json` in the data directory (`{"order": [...], "disabled": [...]}`); new folders are enabled automatically. Details in [docs/MODS.md](docs/MODS.md).
 - Patches: shadPS4-format XML placed in `patches\` is compiled into `patches.bin` at launch. Frame-rate unlock, render resolution and effect toggles all go through this channel.
-- **`patches\Bloodborne.xml` is bundled and required** — `patches.py` fails without it. It is the port's built-in patch database: its entries derive from [ps4_cheats](https://github.com/shadps4-emu/ps4_cheats) `PATCHES/Bloodborne.xml` with local corrections (missing timesteps on the messengers and loading-screen animations were filled in), and its patch names line up with `FPS_PRESETS` and `EFFECTS` in `patches.py`.
-- **Other community patches are not distributed in this repository.** The `patches\GoldHEN\` and `patches\shadPS4\` subdirectories — and anything you drop in yourself — are outside version control; download from the original authors or community patch repositories (e.g. the [GoldHEN](https://github.com/GoldHEN) patch collection). Patch credits belong to Kyo, Lance McDonald, auser1337, illusion, emoose and other community members.
+- **The patch database is not distributed here and is required.** `patches\Bloodborne.xml` is community patch data whose authors (Kyo, illusion, auser1337, emoose, ...) granted no redistribution rights, and its upstream (`shadps4-emu/ps4_cheats`) carries no LICENSE. The port will not start without it — `patches.py` names the file and where to get it when it is missing. Fetch the Bloodborne 1.09 XML from a community patch collection (e.g. the [GoldHEN](https://github.com/GoldHEN) patch collection) into `patches\`.
+- **`tools/fetch_patches.sh` downloads upstream's copy as a starting point** — but upstream is missing patch names this port looks up (`Skip Intro`, `Disable Motion Blur (perf increase)`), so the script validates what it fetched and **refuses to install a file the port cannot use**. A rejection means "upstream is not sufficient", not "the download failed".
+- **Other community patches are not distributed in this repository.** Anything else you drop into `patches\` is outside version control.
 
 ## Useful environment variables
 
@@ -157,7 +165,7 @@ GTK4 launcher, AppImage packaging and Steam Deck details in `launcher\`, `packag
 - `src\`: the loader (probe.c) and HLE runtime (runtime_*.c); Windows-specific code in win32_*.c and host_sync.h.
 - `scripts\`: offline game-image preparation, module linking, the patch compiler, and the Windows launcher run_windows.py.
 - `gpu\`: the rendering library — vendored shadPS4 video core plus this project's changes: ImGui menu, DLSS/FSR, two-stage draw pipeline, frame capture.
-- `patches\`: the built-in `Bloodborne.xml` plus a drop directory for your own community patch XML (the `GoldHEN\` and `shadPS4\` collections are not in version control).
+- `patches\`: the community patch XML directory. You must supply `Bloodborne.xml` yourself (not in version control); the launcher also reads your other XML from here.
 - `tools\`: development and measurement tools.
 - `tests\`: loader, runtime, patch and rendering tests — `bash build.sh --test`.
 - `documents\`: Chinese-language docs — design review, quality review, developer guide.

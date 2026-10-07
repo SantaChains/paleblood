@@ -13,6 +13,12 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 EBOOT_BASE=0x400000
+# Where the community patch set comes from. Not redistributed here (see .gitignore for why):
+# every author credited in the file kept their rights, and shadps4-emu/ps4_cheats carries no
+# LICENSE, so fetching is the user's step. Note that ps4_cheats is the origin of most of these
+# entries, yet its current file is missing patch names this port looks up (Skip Intro among
+# them), so a community collection is the reliable source; tools/fetch_patches.sh says the same.
+PATCH_DB_HINT='https://github.com/GoldHEN'  # community patch collections (README: Mods and patches)
 # BB_FPS presets: patch names from patches/Bloodborne.xml (app version 01.09). Their patch lists
 # follow shadps4-emu/ps4_cheats PATCHES/Bloodborne.xml of 2026-10-02 (older lists missed timesteps:
 # messengers and loading screen pictures replayed their animations).
@@ -41,6 +47,18 @@ EFFECTS={
 }
 # model_lod: -2 highest, 0 the game's, 1 lower, 2 lowest.
 MODEL_LOD={'-2':'Model LOD -2 (Highest)','1':'Model LOD 1 (Lower)','2':'Model LOD 2 (Lowest)'}
+
+
+class MissingPatchDatabase(Exception):
+    """The community patch set is absent; the port cannot compile patches without it.
+
+    Kept distinct from ValueError so main() can print the one remedy (fetch the file) instead
+    of a generic failure line, and so a wrong-version file does not get the same message.
+    """
+
+    def __init__(self, path):
+        self.path=path
+        super().__init__(str(path))
 
 
 def validate_patch_requirements(names, game):
@@ -168,12 +186,22 @@ def encode(line):
 
 
 def compile_patches(xml, names, app_version, segments):
+    # The patch database is community data we cannot redistribute (see .gitignore), so it is
+    # absent from a fresh clone. Name the file and the way to get it instead of letting
+    # ET.parse raise a bare FileNotFoundError behind a generic "patches failed".
+    if not xml.is_file():
+        raise MissingPatchDatabase(xml)
     found={}
     for meta in ET.parse(xml).getroot().iter('Metadata'):
         if meta.get('Name') in names and meta.get('AppVer')==app_version and meta.get('AppElf','eboot.bin')=='eboot.bin':
             found[meta.get('Name')]=meta
     missing=[n for n in names if n not in found]
-    if missing: raise ValueError(f'patches not found for app version {app_version}: {missing}')
+    if missing:
+        # A wrong AppVer lands here too: the file parsed, the entries did not match. Say which.
+        raise ValueError(f'patches not found for app version {app_version}: {missing}. '
+                         f'{xml.name} must be the Bloodborne 1.09 patch set (Metadata AppVer='
+                         f'{app_version!r}, AppElf="eboot.bin"). If it is another game\'s or '
+                         f'another version\'s, fetch the right one.')
     writes=[]
     for name in names:
         for line in found[name].iter('Line'):
@@ -298,6 +326,11 @@ def main():
         sizes=scaled_sizes(read_settings(a.settings))
         if sizes: print(f'{sizes[0][0]}x{sizes[0][1]} {sizes[1][0]}x{sizes[1][1]}')
         return
+    # Checked before anything reads it: compile_stamp() stats the file next, and a fresh clone
+    # has no patch database at all. Failing here names the file; failing later would surface as
+    # a WinError from an unrelated step.
+    if not a.xml.is_file():
+        raise MissingPatchDatabase(a.xml)
     # A compile takes well under a second but runs at every launch: reuse patches.bin while
     # the stamp matches. A failed compile leaves no stamp, so the next launch retries.
     stamp_path=a.out/'patches-stamp.json'
@@ -342,5 +375,29 @@ def main():
 if __name__=='__main__':
     try:
         main()
+    except MissingPatchDatabase as error:
+        # The only failure with a single, complete remedy. Print it in full instead of a one-line
+        # reason: the user meets this on the very first launch of a fresh clone.
+        sys.exit(f'''patches failed: the community patch database is missing.
+
+  {error.path} does not exist. Bloodborne cannot start without it: the frame-rate
+  presets, the render-resolution presets and every effect switch in bbport.ini are
+  looked up by patch name in this file.
+
+  It is not in the repository because it is community data whose authors granted no
+  redistribution rights. Put it at that path, from either place:
+
+    1. a community patch collection
+         {PATCH_DB_HINT}  (README: "Mods and patches")
+       The Bloodborne 1.09 XML. This is the source that works.
+
+    2. tools/fetch_patches.sh, as a starting point only
+         bash tools/fetch_patches.sh
+       It downloads upstream's Bloodborne.xml, but upstream is missing patch names this
+       port looks up, so the script will tell you it is not usable as-is rather than
+       install it. Compare its entry names against the ones reported below if you use it.
+
+  The file must be the Bloodborne 1.09 set (Metadata AppVer="01.09",
+  AppElf="eboot.bin"). Other community XML may be dropped into the same directory.''')
     except (ValueError, OSError, StopIteration, KeyError, IndexError) as error:
         sys.exit(f'patches failed: {error}')

@@ -43,8 +43,13 @@ if [[ -z $pgo ]]; then
     if [[ -n $(find pgo -name '*.gcda' -print -quit 2>/dev/null) ]]; then pgo=use; else pgo=off; fi
 fi
 mkdir -p pgo
-# Submodules (git clone --recursive, or: git submodule update --init) and this port's changes
-# to FSR-Vulkan (gpu/patches/fsr-vulkan), applied to its working tree once.
+# gpu/third_party/{fsr-vulkan,imgui} and third_party/LibAtrac9 are committed as ordinary files,
+# not submodules (.gitmodules records their origins for provenance only; no 160000 gitlink
+# exists), so `git clone --recursive` is not required and the guard below never fires on a
+# complete clone. It stays for a working tree where those directories are missing.
+#
+# The FSR-Vulkan delta (gpu/patches/fsr-vulkan) is applied to the working tree once. On a fresh
+# clone the committed tree already carries it, so the reverse check succeeds and this is a no-op.
 if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ]]; then
     git submodule update --init --recursive
 fi

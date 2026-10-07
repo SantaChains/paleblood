@@ -11,7 +11,7 @@ bbport 将《血源诅咒》的 PlayStation 4 官方可执行文件直接运行�
 - 本项目仅供学习与技术研究，禁止用于商业用途。
 - 仓库不分发任何游戏文件、游戏资产、美术、字体或解密密钥。使用前必须自备合法获得的《血源诅咒》数字版 dump，版本 1.09。
 - 本项目与 Sony Interactive Entertainment、FromSoftware 无任何关联，Bloodborne 名称与相关商标归其权利人所有。
-- 社区补丁与作弊文件**基本不随仓库分发**（唯一例外是启动必需的 patches\Bloodborne.xml）——其余请从原作者处获取（见"Mod 与补丁"），启用前自行确认其内容。
+- 社区补丁与作弊文件**不随仓库分发**——请从原作者处获取（见"Mod 与补丁"），启用前自行确认其内容。其中 `patches\Bloodborne.xml` 是启动必需、必须由你自行提供的一个。
 - 因安装、使用本项目产生的任何直接或间接后果由使用者自行承担。
 
 ## 状态
@@ -41,7 +41,12 @@ bbport 将《血源诅咒》的 PlayStation 4 官方可执行文件直接运行�
 
 ## 快速开始（Windows）
 
-方式一，一键安装（推荐）。双击 setup.bat：弹出的窗口里选择游戏目录与设置，点 Install/Update 自动安装 MSYS2 与全部依赖包并构建，生成 bbport.ini 与快捷方式。全程无需命令行。之后可随时重跑修改设置；Save settings 只保存设置不构建。
+方式一，一键安装（推荐）。双击 setup.bat：弹出的窗口里选择游戏目录与设置，点 Install/Update 自动安装 MSYS2 与全部依赖包并构建，生成 bbport.ini 与快捷方式。之后可随时重跑修改设置；Save settings 只保存设置不构建。
+
+**两件事安装器不会替你做**，必须先完成，否则启动时会因缺补丁库而失败：
+
+1. 游戏目录：任一区服的 1.09 版 dump（含 eboot.bin 与 sce_module）。
+2. 社区补丁库 `patches\Bloodborne.xml`：见"Mod 与补丁"。仓库不分发它，版权不属于本项目。
 
 方式二，手动，三条命令。
 
@@ -115,8 +120,17 @@ AI 辅助安装（给 AI 助手照着做的配置清单）见 [docs/AI-SETUP.md]
 
 - Mod：mods\ 下每个子目录为一个 mod，可含 dvdroot_ps4\、一层包装目录或直接是 chr\ 等游戏目录；文件名大小写不敏感，后加载覆盖先加载。启停与顺序编辑数据目录的 mods.json（`{"order": [...], "disabled": [...]}`），新目录自动启用。详见 [docs/MODS.md](docs/MODS.md)。
 - 补丁：patches\ 下放置 shadPS4 格式 XML，启动时编译进 patches.bin。帧率、渲染分辨率、画面效果开关均走此通道。
-- **patches\Bloodborne.xml 随仓库分发，是启动必需**（缺失时 patches.py 直接失败）。它是移植的内置补丁库，条目源自 [ps4_cheats](https://github.com/shadps4-emu/ps4_cheats) 的 PATCHES/Bloodborne.xml 并含本地修正（如补齐 messengers 与加载画面的timestep），补丁名与 patches.py 的 FPS_PRESETS、EFFECTS 对应。
-- **其余社区补丁不随仓库分发。**patches\GoldHEN\ 与 patches\shadPS4\ 两个子目录（以及你自己放入的任何文件）不在版本控制内，请从原作者或社区补丁库（如 [GoldHEN](https://github.com/GoldHEN) 补丁合集）获取。补丁版权归 Kyo、Lance McDonald、auser1337、illusion、emoose 等社区成员所有。
+- **补丁库不随仓库分发，但启动必需。**`patches\Bloodborne.xml` 是社区补丁数据，
+  其作者（Kyo、illusion、auser1337、emoose 等）未授权再分发，且上游
+  `shadps4-emu/ps4_cheats` 无 LICENSE。缺它移植无法启动——`patches.py` 会在报错中
+  指明该文件与获取途径。请从社区补丁合集（如 [GoldHEN](https://github.com/GoldHEN)
+  补丁合集）取 Bloodborne 1.09 的 XML 放入 `patches\`。
+- **`tools/fetch_patches.sh` 可拉取上游版本作为起点** —— 但上游缺少本移植要查找的
+  补丁名（`Skip Intro`、`Disable Motion Blur (perf increase)`），因此脚本会校验
+  下载结果并**拒绝安装本移植无法使用的文件**。被拒绝意味着「上游不够用」，
+  而不是「下载失败」。
+- **其余社区补丁同样不随仓库分发。**你自己放进 `patches\` 的其他 XML 也不在版本
+  控制内。补丁版权归 Kyo、Lance McDonald、auser1337、illusion、emoose 等社区成员所有。
 
 ## 常用环境变量
 
@@ -159,7 +173,7 @@ GTK4 启动器、AppImage 打包与 Steam Deck 细节见 launcher\、packaging\ 
 - src\：加载器 probe.c 与 HLE 运行时 runtime_*.c；Windows 专属实现在 win32_*.c 与 host_sync.h。
 - scripts\：游戏映像离线准备、模块链接、补丁编译器、Windows 启动器 run_windows.py。
 - gpu\：渲染库。vendored 的 shadPS4 视频核加本项目改动，含 ImGui 菜单、DLSS/FSR、双阶段绘制管线与帧捕获。
-- patches\：内置的 Bloodborne.xml（启动必需，随仓库分发），以及放自己社区补丁 XML 的目录（GoldHEN\、shadPS4\ 两个子目录不在版本控制内）。
+- patches\：社区补丁 XML 目录。你必须自行提供 `Bloodborne.xml`（不在版本控制内）；启动器也会读取你放在这里的其他 XML。
 - tools\：开发与测量工具。
 - tests\：加载器、运行时、补丁与渲染测试，bash build.sh --test 运行。
 - documents\：中文文档，设计评审 design-review.zh.md、代码质量审查 quality-review.zh.md、开发者指南 dev-guide.zh.md。
