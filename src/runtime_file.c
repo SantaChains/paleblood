@@ -252,11 +252,25 @@ static int64_t do_close(int fd) {
     host_unlock(&lock);
     return 0;
 }
-static int host_fd(int fd) {
-    if (fd>=0 && fd<3) return fd;
-    File *f=get(fd);
-    return f ? f->host : -1;
+/* The host descriptor behind a guest fd, and whether the slot is a directory.
+ * Read under the lock: do_open/do_close rewrite files[] (including closing the host fd and
+ * zeroing the slot) with it held, so an unlocked read could hand back a descriptor another
+ * thread has just closed and had recycled — the guest would then read someone else's file.
+ * The value is a snapshot: the descriptor stays valid for this call because a concurrent
+ * do_close on the same guest fd is the guest's own bug (POSIX says the behaviour is
+ * undefined), while the cross-fd recycling this actually prevented is gone. */
+static int host_fd_locked(int fd,int *is_dir) {
+    if (fd>=0 && fd<3) { if (is_dir) *is_dir=0; return fd; }
+    host_lock(&lock);
+    int h=-1;
+    if (fd>=0 && fd<MAX_FILES && files[fd].used) {
+        h=files[fd].host;
+        if (is_dir) *is_dir=files[fd].dir!=NULL;
+    }
+    host_unlock(&lock);
+    return h;
 }
+static int host_fd(int fd) { return host_fd_locked(fd,NULL); }
 /* Pages of the destination may be write-protected for GPU tracking: the kernel's copy then
  * fails with EFAULT instead of faulting to our handler. A user-mode write to each page first
  * goes through the handler, which unprotects it (and records the upcoming write). */
@@ -269,8 +283,9 @@ static void touch_for_write(void *buffer,uint64_t size) {
     }
 }
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
-    int h=host_fd(fd);
-    if (h<0) return get(fd) ? -EISDIR : -EBADF;
+    int is_dir=0;
+    int h=host_fd_locked(fd,&is_dir);
+    if (h<0) return is_dir ? -EISDIR : -EBADF;
     touch_for_write(buffer,size);
     ssize_t n=read(h,buffer,size);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
@@ -278,8 +293,9 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
     return n;
 }
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
-    int h=host_fd(fd);
-    if (h<0) return get(fd) ? -EISDIR : -EBADF;
+    int is_dir=0;
+    int h=host_fd_locked(fd,&is_dir);
+    if (h<0) return is_dir ? -EISDIR : -EBADF;
     touch_for_write(buffer,size);
     ssize_t n=pread(h,buffer,size,offset);
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
@@ -301,23 +317,36 @@ static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset)
     return n<0 ? -errno : n;
 }
 static int64_t do_lseek(int fd,int64_t offset,int whence) {
-    File *f=get(fd);
-    if (!f) return -EBADF;
     if (whence<0 || whence>2) return -EINVAL;
+    host_lock(&lock);
+    File *f=get(fd);
+    if (!f) { host_unlock(&lock); return -EBADF; }
     if (f->dir) {
         /* Directory offsets are entry indices for getdirentries. */
-        if (whence==0 && offset>=0) { f->position=(size_t)offset; return offset; }
-        return -EINVAL;
+        if (whence==0 && offset>=0) { f->position=(size_t)offset; host_unlock(&lock); return offset; }
+        host_unlock(&lock); return -EINVAL;
     }
-    int64_t r=lseek(f->host,offset,whence);
+    int h=f->host;
+    host_unlock(&lock);
+    int64_t r=lseek(h,offset,whence);
     return r<0 ? -errno : r;
 }
 static int64_t do_stat(const char *guest,GuestStat *out);
 static int64_t do_fstat(int fd,GuestStat *out) {
-    int h=host_fd(fd);
+    int is_dir=0;
+    int h=host_fd_locked(fd,&is_dir);
     if (h<0) {
+        /* Windows directory descriptor: fstat on it fails, so stat the path instead. Copy it
+         * out under the lock — do_close zeroes the slot, and a 512-byte path read unlocked
+         * could come back half-cleared. */
+        if (!is_dir) return -EBADF;
+        char path[sizeof(files[0].path)];
+        int found=0;
+        host_lock(&lock);
         File *f=get(fd);
-        return f && f->dir ? do_stat(f->path,out) : -EBADF; /* Windows directory descriptor */
+        if (f) { memcpy(path,f->path,sizeof path); found=1; }
+        host_unlock(&lock);
+        return found ? do_stat(path,out) : -EBADF;
     }
     if (!out) return -EFAULT;
     HostStat s;

@@ -99,6 +99,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
             if (std::abs(i - step) < std::abs(i - best)) best = step;
         }
         v.ui_scale = best;
+    } else if (key == "ui_page") {
+        v.ui_page = std::clamp(i, 0, UiPageCount - 1);
     } else if (key == "live_resolution") {
         v.live_resolution = value == "auto" ? -1 : std::clamp(i, 0, 1);
     } else if (key == "post_deband") {
@@ -150,7 +152,7 @@ void Set(Values& v, const std::string& key, const std::string& value) {
     } else if (key == "gc_writeback") {
         v.gc_writeback = std::clamp(i, 0, 64);
     } else if (key == "gc_budget_mb") {
-        v.gc_budget_mb = std::clamp(i, 0, 65536);
+        v.gc_budget_mb = std::clamp(i, 0, GcBudgetMaxMB);
     } else if (key == "pad_swap") {
         v.pad_swap = std::clamp(i, 0, 3);
     } else if (key == "dlss_preset") {
@@ -175,6 +177,17 @@ void Set(Values& v, const std::string& key, const std::string& value) {
 Values& Get() {
     static Values values;
     return values;
+}
+
+std::string DataDir() {
+    const char* cfg = std::getenv("BB_CONFIG");
+    std::string base = cfg && cfg[0] ? std::string(cfg) : std::string("bbport.ini");
+    const size_t slash = base.find_last_of("/\\");
+    if (slash == std::string::npos) {
+        return std::string(); // bare filename: the working directory
+    }
+    base.resize(slash + 1);
+    return base;
 }
 
 void Load() {
@@ -283,6 +296,7 @@ void Save() {
         "fps_detail",
         "fsr4_auto_exposure", "fsr4_invert_jitter", "model_lod",      "output_res",
         "display_mode",       "hide_cursor",        "display",        "ui_scale",
+        "ui_page",
         "low_latency",
         "live_resolution",    "post_deband",        "post_shadow",    "post_sharpen",
         "post_defog",         "post_contrast",      "post_saturation",
@@ -320,9 +334,15 @@ void Save() {
         }
         std::fclose(old);
     }
-    FILE* file = std::fopen(Path(), "w");
+    // Write to a sibling temporary and rename over the target, so a kill or a full disk
+    // mid-write leaves the previous file intact instead of a truncated one. A plain "w" open
+    // truncates first: a crash a few lines in would leave an ini the next Load() reads as
+    // mostly missing keys, silently resetting the user's settings.
+    const std::string target = Path();
+    const std::string tmp = target + ".tmp";
+    FILE* file = std::fopen(tmp.c_str(), "w");
     if (!file) {
-        std::printf("Settings: cannot write %s\n", Path());
+        std::printf("Settings: cannot write %s\n", tmp.c_str());
         return;
     }
     std::fprintf(file,
@@ -341,11 +361,14 @@ void Save() {
     for (int e = 0; e < EffectCount; ++e) {
         std::fprintf(file, "%s=%d\n", Effects[e].key, int(v.effects[e].load()));
     }
-    std::fprintf(file, "model_lod=%d\noutput_res=%dx%d\n", v.model_lod.load(),
-                 OutputWidths[v.output_res], OutputHeights[v.output_res]);
-    std::fprintf(file, "display_mode=%d\nhide_cursor=%d\ndisplay=%d\nui_scale=%d\n",
+    // Clamp before indexing: output_res is an index into these tables, and a hand-edited or
+    // env-overridden value outside [0, OutputCount) would read past the array.
+    const int res = std::clamp(v.output_res.load(), 0, OutputCount - 1);
+    std::fprintf(file, "model_lod=%d\noutput_res=%dx%d\n", v.model_lod.load(), OutputWidths[res],
+                 OutputHeights[res]);
+    std::fprintf(file, "display_mode=%d\nhide_cursor=%d\ndisplay=%d\nui_scale=%d\nui_page=%d\n",
                  v.display_mode.load(), v.hide_cursor.load(), v.display.load(),
-                 v.ui_scale.load());
+                 v.ui_scale.load(), v.ui_page.load());
     std::fprintf(file, "low_latency=%d\n", int(v.low_latency.load()));
     std::fprintf(file, "post_deband=%d\npost_shadow=%d\npost_sharpen=%d\n", v.post_deband.load(),
                  v.post_shadow.load(), v.post_sharpen.load());
@@ -374,7 +397,19 @@ void Save() {
     for (const std::string& kept : foreign) {
         std::fprintf(file, "%s\n", kept.c_str());
     }
+    // fflush before rename: the rename is only atomic with respect to data already handed to
+    // the OS, and a buffered tail lost in a crash would defeat the point of the temporary.
+    if (std::fflush(file) != 0 || std::ferror(file)) {
+        std::fclose(file);
+        std::remove(tmp.c_str());
+        std::printf("Settings: write failed, %s left unchanged\n", target.c_str());
+        return;
+    }
     std::fclose(file);
+    if (std::rename(tmp.c_str(), target.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        std::printf("Settings: cannot replace %s\n", target.c_str());
+    }
 }
 
 float PresetScale(int preset) {

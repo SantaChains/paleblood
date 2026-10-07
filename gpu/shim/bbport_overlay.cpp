@@ -8,6 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 
 #include <SDL3/SDL.h>
 #include "bbport_menu_blur.h"
@@ -71,7 +74,6 @@ std::mutex imgui_mutex; // the ImGui context: window thread (input) and present 
 std::atomic<bool> initialized{false};
 std::atomic<bool> menu_open{false};
 bool l3_down = false, r3_down = false;
-bool dirty = false; // settings changed while open: saved on close
 float base_scale = 1.0f;
 float menu_anim = 0.0f; // open ramp 0..1 (the close stays instant)
 
@@ -91,8 +93,15 @@ float frame_ms_max = 0.0f; // recent worst frame, decays so spikes age out
 // Driver-measured frame latency (VK_NV_low_latency2); negative while unavailable.
 std::atomic<float> latency_ms{-1.0f};
 
-// Texture-cache GC telemetry fed by the presenter (the present thread both feeds and draws).
-GcSnapshot gc_stats{};
+// Texture-cache GC telemetry fed by the presenter. The present thread both feeds and reads it
+// today, but a 5-field struct cannot be read while another thread writes it: the numbers would
+// be from different collections. One atomic per field makes every read a consistent-enough
+// snapshot (a second-stale counter at worst) and lets the producer move to another thread.
+struct AtomicGcStats {
+    std::atomic<u64> used_memory{0}, pressure_memory{0}, critical_memory{0}, evictions{0},
+        downloads{0};
+};
+AtomicGcStats gc_stats;
 
 const char* UpscalerLabel(int upscaler) {
     switch (upscaler) {
@@ -115,10 +124,27 @@ void SetOpen(bool value) {
     ImGui::GetIO().MouseDrawCursor = value;
     if (!value) {
         ImGui::GetIO().ClearInputKeys(); // no nav keys stuck down across open/close cycles
-        if (dirty) {
-            dirty = false;
-            BbSettings::Save();
-        }
+        // Both writes are synchronous disk I/O, and this runs with imgui_mutex held (the two
+        // HandleEvent call sites lock it) — the present thread takes that lock every frame, so
+        // doing the work inline stalls rendering for as long as the disk takes.
+        //
+        // The ini needs the ImGui context, so it can only be written while holding the lock;
+        // BbSettings::Save() only reads atomics and has its own mutex. Both are therefore
+        // handed to one detached thread that takes the lock itself, after the caller has
+        // released it — trying to take it here would deadlock against the present thread,
+        // which is waiting for this thread to leave the critical section.
+        //
+        // Losing the very last edit to a process that exits immediately after is not a
+        // regression: the ini is already flushed on IniSavingRate while the menu is open.
+        std::thread([] {
+            std::scoped_lock lock{imgui_mutex};
+            if (initialized) {
+                // No default argument in this version: the null means "use io.IniFilename",
+                // which is what the automatic IniSavingRate path does.
+                ImGui::SaveIniSettingsToDisk(nullptr);
+            }
+        }).detach();
+        std::thread([] { BbSettings::Save(); }).detach();
     }
 }
 
@@ -173,12 +199,22 @@ float PixelDensity(SDL_WindowID id) {
     return density > 0.0f ? density : 1.0f;
 }
 
-// Marks the settings dirty when a widget changed them.
+// The ImGui ini, next to bbport.ini (BB_CONFIG) so the UI layout follows the data directory
+// like every other user-owned file. Kept in a global because io.IniFilename is a bare const
+// char* that ImGui only reads; the alternative (SaveIniSettingsToMemory on demand) would mean
+// carrying the buffer across threads for no gain.
+std::string UiIniPath() {
+    return BbSettings::DataDir() + "bbport_ui.ini";
+}
+
+std::string g_ui_ini_path;
+
+// Applies a widget's new value. Saving is unconditional on menu close (the close path hands
+// both files to a background thread), so there is no dirty flag to keep.
 template <typename T>
 void Store(std::atomic<T>& target, T value, bool changed) {
     if (changed) {
         target = value;
-        dirty = true;
     }
 }
 
@@ -208,6 +244,367 @@ void Hint(const char* text) {
 }
 
 enum Page { PageGraphics, PageDisplay, PageEffects, PageCheats, PageAdvanced, PageCount };
+static_assert(PageCount == BbSettings::UiPageCount, "ui_page clamp must match the page list");
+
+// ---------------------------------------------------------------------------
+// Colour-grade style presets
+//
+// A preset is exactly the set of sliders a "look" moves: shadow, contrast, saturation,
+// vibrance, CDL lift/gamma/gain, levels, grain and mono. Deband, defog and sharpen stay
+// out of it — they are corrections, not grades, and are tuned per scene rather than per look.
+// ---------------------------------------------------------------------------
+
+struct StylePreset {
+    const char* name;
+    int shadow, contrast, sat, vib;
+    int lr, lg, lb, gr, gg, gb, sr, sg, sb, lbk, lwh, grain;
+    bool mono;
+};
+
+/// A preset with a heap-allocated name, so the five built-ins (string literals) and the
+/// user slots (read from the save dialog) share one type.
+struct StyleSlot {
+    std::string name;
+    int shadow, contrast, sat, vib;
+    int lr, lg, lb, gr, gg, gb, sr, sg, sb, lbk, lwh, grain;
+    bool mono;
+};
+
+StyleSlot MakeSlot(std::string name, const StylePreset& p) {
+    return StyleSlot{std::move(name), p.shadow, p.contrast, p.sat,   p.vib, p.lr, p.lg,
+                     p.lb,      p.gr,           p.gg,      p.gb,   p.sr, p.sg, p.sb,
+                     p.lbk,     p.lwh,          p.grain,   p.mono};
+}
+
+// Defined below; UserStyles() calls this on first use so the file is read once, lazily,
+// the first time the combo is opened rather than during Init.
+void LoadUserStyles();
+void SaveUserStyles();
+void DeleteUserStyle(int index);
+void DrawSaveStylePopup();
+bool StyleMatches(const StyleSlot& p, const BbSettings::Values& s);
+void ApplyStyle(const StyleSlot& p, BbSettings::Values& s);
+std::vector<StyleSlot>& StylePresets();
+const std::vector<StyleSlot>& UserStyles();
+constexpr StylePreset kBuiltinStyles[] = {
+    {"原味", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false},
+    {"胶片印象", 10, 5, -8, 0, 4, 4, 8, 0, 0, 0, 0, 0, 0, 6, 0, 30, false},
+    {"冷蓝夜曲", 6, 0, -15, 0, 0, 2, 10, -6, 0, 0, 2, 0, 6, 0, 0, 15, false},
+    {"暖褐怀旧", 8, 6, -25, 10, 6, 3, -2, 0, 0, 0, 5, 2, -4, 0, 0, 20, false},
+    {"黑白惊悚", 5, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 35, true},
+};
+constexpr int kBuiltinStyleCount = int(sizeof(kBuiltinStyles) / sizeof(kBuiltinStyles[0]));
+/// First index of a user slot inside the combined list (StylePresets()).
+constexpr int StyleUserBase = kBuiltinStyleCount;
+constexpr int kMaxUserStyles = 32;
+
+/// User slots. std::string because the name comes from the popup's input field.
+std::vector<StyleSlot> g_user_styles;
+bool g_user_styles_loaded = false;
+/// Set when a slot is added or removed, so StylePresets() rebuilds its cache.
+bool g_style_list_dirty = false;
+bool save_style_popup = false;
+char save_style_name[64] = "";
+
+/// user-presets.json next to bbport.ini (the same data-directory convention as
+/// cheats/state.txt and mods.json).
+std::string UserStylePath() {
+    return BbSettings::DataDir() + "user-presets.json";
+}
+
+const std::vector<StyleSlot>& UserStyles() {
+    if (!g_user_styles_loaded) {
+        g_user_styles_loaded = true;
+        LoadUserStyles();
+    }
+    return g_user_styles;
+}
+
+/// Built-ins followed by the user's slots, cached: the combo is rebuilt every frame the menu
+/// is open, and StylePresets() copies every name, so the result is memoised until a slot is
+/// added or deleted (bump g_style_list_dirty).
+std::vector<StyleSlot>& StylePresets() {
+    static std::vector<StyleSlot> cache;
+    static bool built = false;
+    if (!built || g_style_list_dirty) {
+        cache.clear();
+        cache.reserve(kBuiltinStyleCount + UserStyles().size());
+        for (const auto& b : kBuiltinStyles) {
+            cache.push_back(MakeSlot(b.name, b));
+        }
+        for (const auto& u : UserStyles()) {
+            cache.push_back(u);
+        }
+        built = true;
+        g_style_list_dirty = false;
+    }
+    return cache;
+}
+
+// A deliberately small JSON subset: one flat object per preset, integers and one bool, no
+// nesting and no escaping beyond \" and \\. A hand-edited or corrupt file must never take the
+// game down, so every parse is bounds-checked and a failure just yields no user slots.
+void LoadUserStyles() {
+    std::FILE* f = std::fopen(UserStylePath().c_str(), "rb");
+    if (!f) {
+        return;
+    }
+    std::string text;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) {
+        text.append(buf, n);
+    }
+    std::fclose(f);
+
+    size_t pos = 0;
+    const auto skip_ws = [&] {
+        while (pos < text.size() && (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\n' ||
+                                     text[pos] == '\r' || text[pos] == ',')) {
+            ++pos;
+        }
+    };
+    const auto read_string = [&](std::string& out) {
+        skip_ws();
+        if (pos >= text.size() || text[pos] != '"') {
+            return false;
+        }
+        ++pos;
+        out.clear();
+        while (pos < text.size() && text[pos] != '"') {
+            if (text[pos] == '\\' && pos + 1 < text.size()) {
+                ++pos;
+            }
+            out.push_back(text[pos++]);
+        }
+        if (pos >= text.size()) {
+            return false;
+        }
+        ++pos; // closing quote
+        return true;
+    };
+    // Reads "key": <number|true|false> and returns the value as a string (numbers verbatim).
+    const auto read_member = [&](std::string& key, std::string& value) {
+        if (!read_string(key)) {
+            return false;
+        }
+        skip_ws();
+        if (pos < text.size() && text[pos] == ':') {
+            ++pos;
+        }
+        skip_ws();
+        if (pos >= text.size()) {
+            return false;
+        }
+        value.clear();
+        if (text[pos] == '"') {
+            return read_string(value);
+        }
+        while (pos < text.size() && text[pos] != ',' && text[pos] != '}' && text[pos] != ' ' &&
+               text[pos] != '\n' && text[pos] != '\r' && text[pos] != '\t') {
+            value.push_back(text[pos++]);
+        }
+        return !value.empty();
+    };
+    const auto to_int = [](const std::string& v, int fallback) {
+        try {
+            return std::stoi(v);
+        } catch (...) {
+            return fallback;
+        }
+    };
+
+    if (text.find('[') == std::string::npos) {
+        return; // not our format
+    }
+    pos = text.find('[') + 1;
+    for (int guard = 0; guard < 4096; ++guard) {
+        skip_ws();
+        if (pos >= text.size() || text[pos] == ']') {
+            break;
+        }
+        if (text[pos] != '{') {
+            break;
+        }
+        ++pos;
+        StyleSlot slot{};
+        slot.name = "未命名";
+        // Defaults are the neutral grade; a missing member leaves it alone.
+        slot.mono = false;
+        while (true) {
+            skip_ws();
+            if (pos >= text.size() || text[pos] == '}') {
+                ++pos;
+                break;
+            }
+            std::string key, value;
+            if (!read_member(key, value)) {
+                return; // malformed: drop what we have, keep the built-ins
+            }
+            if (key == "name") {
+                if (!value.empty()) {
+                    slot.name = value;
+                }
+            } else if (key == "shadow") slot.shadow = to_int(value, 0);
+            else if (key == "contrast") slot.contrast = to_int(value, 0);
+            else if (key == "sat") slot.sat = to_int(value, 0);
+            else if (key == "vib") slot.vib = to_int(value, 0);
+            else if (key == "lr") slot.lr = to_int(value, 0);
+            else if (key == "lg") slot.lg = to_int(value, 0);
+            else if (key == "lb") slot.lb = to_int(value, 0);
+            else if (key == "gr") slot.gr = to_int(value, 0);
+            else if (key == "gg") slot.gg = to_int(value, 0);
+            else if (key == "gb") slot.gb = to_int(value, 0);
+            else if (key == "sr") slot.sr = to_int(value, 0);
+            else if (key == "sg") slot.sg = to_int(value, 0);
+            else if (key == "sb") slot.sb = to_int(value, 0);
+            else if (key == "lbk") slot.lbk = to_int(value, 0);
+            else if (key == "lwh") slot.lwh = to_int(value, 0);
+            else if (key == "grain") slot.grain = to_int(value, 0);
+            else if (key == "mono") slot.mono = value == "true" || value == "1";
+        }
+        if (!slot.name.empty() && int(g_user_styles.size()) < kMaxUserStyles) {
+            g_user_styles.push_back(std::move(slot));
+        }
+    }
+}
+
+void SaveUserStyles() {
+    const std::string path = UserStylePath();
+    const std::string tmp = path + ".tmp"; // write-then-rename: a kill mid-write keeps the old file
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) {
+        std::printf("Overlay: cannot write %s\n", tmp.c_str());
+        return;
+    }
+    std::fprintf(f, "{\n  \"presets\": [\n");
+    for (size_t i = 0; i < g_user_styles.size(); ++i) {
+        const auto& p = g_user_styles[i];
+        // The name comes from a free-text field: escape what JSON treats as structure, or a
+        // quote or backslash in it would corrupt the file (and LoadUserStyles would then drop
+        // every slot after the broken one).
+        std::string esc;
+        esc.reserve(p.name.size() + 8);
+        for (const char c : p.name) {
+            if (c == '"' || c == '\\') {
+                esc.push_back('\\');
+            }
+            if (static_cast<unsigned char>(c) < 0x20) {
+                continue; // control characters would break the line-based format
+            }
+            esc.push_back(c);
+        }
+        std::fprintf(f,
+                     "    {\"name\": \"%s\", \"shadow\": %d, \"contrast\": %d, \"sat\": %d, "
+                     "\"vib\": %d, \"lr\": %d, \"lg\": %d, \"lb\": %d, \"gr\": %d, \"gg\": %d, "
+                     "\"gb\": %d, \"sr\": %d, \"sg\": %d, \"sb\": %d, \"lbk\": %d, \"lwh\": %d, "
+                     "\"grain\": %d, \"mono\": %s}%s\n",
+                     esc.c_str(), p.shadow, p.contrast, p.sat, p.vib, p.lr, p.lg, p.lb, p.gr,
+                     p.gg, p.gb, p.sr, p.sg, p.sb, p.lbk, p.lwh, p.grain, p.mono ? "true" : "false",
+                     i + 1 == g_user_styles.size() ? "" : ",");
+    }
+    std::fprintf(f, "  ]\n}\n");
+    std::fclose(f);
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::printf("Overlay: cannot replace %s\n", path.c_str());
+        try {
+            std::remove(tmp.c_str());
+        } catch (...) {
+        }
+    }
+}
+
+void DeleteUserStyle(int index) {
+    if (index < 0 || index >= int(g_user_styles.size())) {
+        return;
+    }
+    g_user_styles.erase(g_user_styles.begin() + index);
+    g_style_list_dirty = true;
+    SaveUserStyles();
+}
+
+void DrawSaveStylePopup() {
+    auto& s = BbSettings::Get();
+    // Opening is deferred to the frame after the button click: OpenPopup only marks the id,
+    // and BeginPopupModal must not be called in the same frame the id was pushed.
+    if (!save_style_popup) {
+        return;
+    }
+    save_style_name[0] = '\0';
+    ImGui::OpenPopup("保存风格");
+    save_style_popup = false;
+    ImGui::SetNextWindowSize(ImVec2(360.0f * base_scale, 0.0f), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("保存风格", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        // Not open yet (it appears the frame after OpenPopup) or closed by Esc: when Begin
+        // returns false there is no popup on the stack, so EndPopup must not be called.
+        return;
+    }
+    ImGui::TextUnformatted("把当前的调色参数存为一个可复用的风格。");
+    ImGui::Spacing();
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputText("名称", save_style_name, sizeof save_style_name);
+    const std::string name = save_style_name;
+    const bool empty = name.find_first_not_of(" \t") == std::string::npos;
+    const bool full = int(g_user_styles.size()) >= kMaxUserStyles;
+    if (full) {
+        ImGui::TextDisabled("已达上限（%d 个），先删除一个。", kMaxUserStyles);
+    }
+    ImGui::BeginDisabled(empty || full);
+    if (ImGui::Button("保存", ImVec2(120.0f, 0.0f))) {
+        g_user_styles.push_back(MakeSlot(name, StylePreset{
+                                               name.c_str(),
+                                               s.post_shadow,    s.post_contrast,
+                                               s.post_saturation, s.post_vibrance,
+                                               s.post_lift_r,    s.post_lift_g,
+                                               s.post_lift_b,    s.post_gamma_r,
+                                               s.post_gamma_g,   s.post_gamma_b,
+                                               s.post_gain_r,    s.post_gain_g,
+                                               s.post_gain_b,    s.post_levels_black,
+                                               s.post_levels_white, s.post_grain,
+                                               s.post_mono}));
+        SaveUserStyles();
+        g_style_list_dirty = true;
+        save_style_popup = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("取消", ImVec2(120.0f, 0.0f))) {
+        save_style_popup = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+bool StyleMatches(const StyleSlot& p, const BbSettings::Values& s) {
+    return s.post_shadow == p.shadow && s.post_contrast == p.contrast &&
+           s.post_saturation == p.sat && s.post_vibrance == p.vib &&
+           s.post_lift_r == p.lr && s.post_lift_g == p.lg && s.post_lift_b == p.lb &&
+           s.post_gamma_r == p.gr && s.post_gamma_g == p.gg && s.post_gamma_b == p.gb &&
+           s.post_gain_r == p.sr && s.post_gain_g == p.sg && s.post_gain_b == p.sb &&
+           s.post_levels_black == p.lbk && s.post_levels_white == p.lwh &&
+           s.post_grain == p.grain && s.post_mono == p.mono;
+}
+
+void ApplyStyle(const StyleSlot& p, BbSettings::Values& s) {
+    Store(s.post_shadow, p.shadow, true);
+    Store(s.post_contrast, p.contrast, true);
+    Store(s.post_saturation, p.sat, true);
+    Store(s.post_vibrance, p.vib, true);
+    Store(s.post_lift_r, p.lr, true);
+    Store(s.post_lift_g, p.lg, true);
+    Store(s.post_lift_b, p.lb, true);
+    Store(s.post_gamma_r, p.gr, true);
+    Store(s.post_gamma_g, p.gg, true);
+    Store(s.post_gamma_b, p.gb, true);
+    Store(s.post_gain_r, p.sr, true);
+    Store(s.post_gain_g, p.sg, true);
+    Store(s.post_gain_b, p.sb, true);
+    Store(s.post_levels_black, p.lbk, true);
+    Store(s.post_levels_white, p.lwh, true);
+    Store(s.post_grain, p.grain, true);
+    Store(s.post_mono, p.mono, true);
+}
 
 const char* PageName(int page) {
     static const char* names[PageCount] = {"画面", "显示", "游戏效果", "作弊", "高级"};
@@ -544,57 +941,63 @@ void EffectsPage() {
         {
             // One-click looks: they only move the colour-grade sliders below (shadow, contrast,
             // saturation, vibrance, CDL, levels, grain, mono); deband/defog/sharpen stay put.
-            struct StylePreset {
-                const char* name;
-                int shadow, contrast, sat, vib;
-                int lr, lg, lb, gr, gg, gb, sr, sg, sb, lbk, lwh, grain;
-                bool mono;
-            };
-            static constexpr StylePreset presets[] = {
-                {"原味", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false},
-                {"胶片印象", 10, 5, -8, 0, 4, 4, 8, 0, 0, 0, 0, 0, 0, 6, 0, 30, false},
-                {"冷蓝夜曲", 6, 0, -15, 0, 0, 2, 10, -6, 0, 0, 2, 0, 6, 0, 0, 15, false},
-                {"暖褐怀旧", 8, 6, -25, 10, 6, 3, -2, 0, 0, 0, 5, 2, -4, 0, 0, 20, false},
-                {"黑白惊悚", 5, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 35, true},
-            };
+            //
+            // The five built-ins are compiled in, but the list is a runtime vector: the user can
+            // save the current grade as a named slot, rename it, reorder and delete it. Slots
+            // live in user-presets.json next to bbport.ini, the same data-directory convention
+            // as cheats/state.txt and mods.json — bbport.ini stays the start-up configuration and
+            // does not collect run-time artefacts.
             int current = -1;
-            for (int i = 0; i < 5; ++i) {
-                const auto& p = presets[i];
-                if (s.post_shadow == p.shadow && s.post_contrast == p.contrast &&
-                    s.post_saturation == p.sat && s.post_vibrance == p.vib &&
-                    s.post_lift_r == p.lr && s.post_lift_g == p.lg && s.post_lift_b == p.lb &&
-                    s.post_gamma_r == p.gr && s.post_gamma_g == p.gg &&
-                    s.post_gamma_b == p.gb && s.post_gain_r == p.sr &&
-                    s.post_gain_g == p.sg && s.post_gain_b == p.sb &&
-                    s.post_levels_black == p.lbk && s.post_levels_white == p.lwh &&
-                    s.post_grain == p.grain && s.post_mono == p.mono) {
+            for (int i = 0; i < int(StylePresets().size()); ++i) {
+                if (StyleMatches(StylePresets()[i], s)) {
                     current = i;
+                    break; // first match wins: "原味" is the neutral grade, a user slot that
+                           // happens to be neutral should not shadow it
                 }
             }
-            if (ImGui::BeginCombo("风格预设", current >= 0 ? presets[current].name : "自定义")) {
-                for (int i = 0; i < 5; ++i) {
-                    if (ImGui::Selectable(presets[i].name, i == current)) {
-                        const auto& p = presets[i];
-                        Store(s.post_shadow, p.shadow, true);
-                        Store(s.post_contrast, p.contrast, true);
-                        Store(s.post_saturation, p.sat, true);
-                        Store(s.post_vibrance, p.vib, true);
-                        Store(s.post_lift_r, p.lr, true);
-                        Store(s.post_lift_g, p.lg, true);
-                        Store(s.post_lift_b, p.lb, true);
-                        Store(s.post_gamma_r, p.gr, true);
-                        Store(s.post_gamma_g, p.gg, true);
-                        Store(s.post_gamma_b, p.gb, true);
-                        Store(s.post_gain_r, p.sr, true);
-                        Store(s.post_gain_g, p.sg, true);
-                        Store(s.post_gain_b, p.sb, true);
-                        Store(s.post_levels_black, p.lbk, true);
-                        Store(s.post_levels_white, p.lwh, true);
-                        Store(s.post_grain, p.grain, true);
-                        Store(s.post_mono, p.mono, true);
+            // StylePresets()[i].name is a std::string; the preview is read-only, so the
+            // pointer only has to outlive this frame — the vector is a function-local static
+            // that lives until the process ends.
+            const char* preview = "自定义";
+            if (current >= 0) {
+                preview = StylePresets()[current].name.c_str();
+            }
+            if (ImGui::BeginCombo("风格预设", preview)) {
+                // Built-ins first, then a separator and the user's own slots. Both live in the
+                // same combined list, so index i in StylePresets() addresses both.
+                const int count = int(StylePresets().size());
+                for (int i = 0; i < count; ++i) {
+                    if (i == StyleUserBase) {
+                        ImGui::Separator();
+                        ImGui::TextDisabled("我的风格");
+                    }
+                    if (ImGui::Selectable(StylePresets()[i].name.c_str(), i == current)) {
+                        ApplyStyle(StylePresets()[i], s);
+                    }
+                    if (i >= StyleUserBase) {
+                        // This ImGui version (1.92.9b) dropped EndPopupContextItem: Begin
+                        // forwards to BeginPopup, so a true return needs the matching EndPopup.
+                        // Also note the index shifts after a delete, which is why the loop
+                        // re-reads the size each pass rather than caching it.
+                        if (ImGui::BeginPopupContextItem("style_del")) {
+                            if (ImGui::MenuItem("删除此风格")) {
+                                DeleteUserStyle(i - StyleUserBase);
+                            }
+                            ImGui::EndPopup();
+                        }
                     }
                 }
                 ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("保存当前")) {
+                save_style_popup = true; // drawn by DrawSaveStylePopup() below
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("把当前的调色参数存为“我的风格”槽位");
+            }
+            if (save_style_popup) {
+                DrawSaveStylePopup();
             }
             Hint("一键套用调色：只动下面的调色滑杆（暗部、对比、饱和、智能饱和、三级调色、黑白场、"
                  "颗粒、单色），去色带、去雾与锐化不受影响；滑杆改动后显示为自定义。");
@@ -766,7 +1169,8 @@ void AdvancedPage() {
     {
         int v = s.gc_budget_mb.load();
         const bool changed =
-            ImGui::SliderInt("GC 显存预算 (MiB)", &v, 0, 16384, v ? "%d MiB" : "0（自动）");
+            ImGui::SliderInt("GC 显存预算 (MiB)", &v, 0, BbSettings::GcBudgetMaxMB,
+                             v ? "%d MiB" : "0（自动）");
         Store(s.gc_budget_mb, v, changed);
     }
     Hint("显存使用超过预算的 70% 开始回收、85% 加压、95% 激进。0 按驱动实时预算（集成 GPU 恒"
@@ -784,12 +1188,12 @@ void AdvancedPage() {
     Hint("任天堂布局手柄选最后一项，立即生效。BB_PAD_SWAP 可在启动时预设同样的值。");
     if (ImGui::CollapsingHeader("资源调度（纹理缓存）")) {
         ImGui::Text("显存用量 %llu MiB（加压线 %llu / 临界线 %llu MiB）",
-                    (unsigned long long)(gc_stats.used_memory >> 20),
-                    (unsigned long long)(gc_stats.pressure_memory >> 20),
-                    (unsigned long long)(gc_stats.critical_memory >> 20));
+                    (unsigned long long)(gc_stats.used_memory.load() >> 20),
+                    (unsigned long long)(gc_stats.pressure_memory.load() >> 20),
+                    (unsigned long long)(gc_stats.critical_memory.load() >> 20));
         ImGui::Text("上轮回收：逐出 %llu 张，写回 %llu 张",
-                    (unsigned long long)gc_stats.evictions,
-                    (unsigned long long)gc_stats.downloads);
+                    (unsigned long long)gc_stats.evictions.load(),
+                    (unsigned long long)gc_stats.downloads.load());
         Hint("显存用量越过预算 70% 开始回收，85% 加压、95% 激进；写回指 GPU 改过的纹理在"
              "逐出前落回 CPU 内存。计数自上次压力报告起累计，约 5 秒一轮。");
     }
@@ -873,40 +1277,38 @@ void Menu() {
                 frame_ms_avg);
     ImGui::Spacing();
 
-    static int page = 0;
+    // The selected tab is not one of the window properties ImGui stores by itself, so it
+    // rides along in bbport.ini as ui_page (same path as ui_scale). Written on close with the
+    // rest of the menu's changes, so the menu reopens on the page it was left on.
+    auto& s = BbSettings::Get();
+    int page = std::clamp(s.ui_page.load(), 0, int(PageCount) - 1);
     const float footer = ImGui::GetFrameHeightWithSpacing();
     if (ImGui::BeginTabBar("##pages")) {
-        if (ImGui::BeginTabItem(PageName(PageGraphics))) {
-            ImGui::BeginChild("##pg0", ImVec2(0.0f, -footer));
-            GraphicsPage();
-            ImGui::EndChild();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem(PageName(PageDisplay))) {
-            ImGui::BeginChild("##pg1", ImVec2(0.0f, -footer));
-            DisplayPage();
-            ImGui::EndChild();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem(PageName(PageEffects))) {
-            ImGui::BeginChild("##pg2", ImVec2(0.0f, -footer));
-            EffectsPage();
-            ImGui::EndChild();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem(PageName(PageCheats))) {
-            ImGui::BeginChild("##pg3", ImVec2(0.0f, -footer));
-            CheatsPage();
-            ImGui::EndChild();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem(PageName(PageAdvanced))) {
-            ImGui::BeginChild("##pg4", ImVec2(0.0f, -footer));
-            AdvancedPage();
-            ImGui::EndChild();
-            ImGui::EndTabItem();
+        // BeginTabItem's second parameter is bool* (a close button), not a "selected" flag;
+        // selection is requested with ImGuiTabItemFlags_SetSelected on the flags argument.
+        for (int p = 0; p < PageCount; ++p) {
+            if (ImGui::BeginTabItem(PageName(p), nullptr,
+                                    p == page ? ImGuiTabItemFlags_SetSelected
+                                              : ImGuiTabItemFlags_None)) {
+                page = p;
+                // The child's ID is the visible page name scoped under the tab's ID, so the
+                // per-page scroll position persists across switches and restarts.
+                ImGui::BeginChild(PageName(p), ImVec2(0.0f, -footer));
+                switch (p) {
+                case PageGraphics: GraphicsPage(); break;
+                case PageDisplay: DisplayPage(); break;
+                case PageEffects: EffectsPage(); break;
+                case PageCheats: CheatsPage(); break;
+                default: AdvancedPage(); break;
+                }
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
         }
         ImGui::EndTabBar();
+    }
+    if (page != s.ui_page.load()) {
+        Store(s.ui_page, page, true);
     }
 
     if (ImGui::Button("关闭")) {
@@ -984,7 +1386,13 @@ void SetLatencyMs(float ms) {
 }
 
 void SetGcStats(const GcSnapshot& stats) {
-    gc_stats = stats;
+    // Relaxed is enough: these are counters, not synchronisation. Nothing else depends on the
+    // values, and the menu reading them a frame late is harmless.
+    gc_stats.used_memory.store(stats.used_memory, std::memory_order_relaxed);
+    gc_stats.pressure_memory.store(stats.pressure_memory, std::memory_order_relaxed);
+    gc_stats.critical_memory.store(stats.critical_memory, std::memory_order_relaxed);
+    gc_stats.evictions.store(stats.evictions, std::memory_order_relaxed);
+    gc_stats.downloads.store(stats.downloads, std::memory_order_relaxed);
 }
 
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
@@ -995,7 +1403,14 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = nullptr; // window positions are not kept
+    // Persist the UI layout: window geometry, the selected tab and every CollapsingHeader's
+    // open state. ImGui writes this itself (IniSavingRate, 5 s by default) and only reads it
+    // once, on the first NewFrame — see LoadIniSettingsFromDisk below. Previously
+    // IniFilename was null, so the menu reopened on the graphics tab with every section
+    // collapsed on each launch.
+    g_ui_ini_path = UiIniPath();
+    io.IniFilename = g_ui_ini_path.c_str();
+    io.IniSavingRate = 5.0f;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
     io.BackendPlatformName = "bbport";

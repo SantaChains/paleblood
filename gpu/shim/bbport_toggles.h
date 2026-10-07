@@ -27,8 +27,12 @@ extern "C" __thread BbRecoverBuf* runtime_fault_recover;
 #endif
 
 namespace BbToggle {
+/// Runtime on/off switches for optional GPU-side work, read from the file named by
+/// BB_TOGGLE_FILE and re-read every 250 ms; all off by default. The bit values are a file
+/// format shared with runtime_memory.c and must not be renumbered. RegionCache is a retired
+/// bit kept so the ones after it keep their numbers — nothing reads it.
 enum : std::uint64_t {
-    RegionCache = 1,
+    RegionCache = 1, ///< retired, unused
     FetchShaderCache = 2,
     PageTrackingEarlyExit = 4,
     PendingPollLimit = 8,

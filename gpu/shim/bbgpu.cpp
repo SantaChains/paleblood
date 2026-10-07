@@ -30,7 +30,6 @@
 
 extern "C" {
 // runtime_memory.c
-int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 int runtime_memory_write_backing(uintptr_t address, const void* data, uint64_t size);
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size);
 int runtime_memory_region(uintptr_t address, uintptr_t* start, uintptr_t* end, int* mapped);
@@ -44,7 +43,13 @@ int32_t* runtime_errno(void);
 void runtime_memory_set_gpu_hooks(RuntimeGpuRange map, RuntimeGpuRange unmap, RuntimeGpuRange invalidate);
 }
 
-Frontend::WindowSDL* g_window = nullptr;
+// Published by the window thread and read by guest threads (the IME entry points below).
+// The window object itself is never freed — the process ends with std::_Exit(0) — so the
+// only hazard is the pointer's own visibility: readers ran on a bare non-atomic pointer while
+// the writer assigned it under g_window_mutex, which is a data race even though the store
+// happens-before the reads in practice. acquire/release states that ordering explicitly and
+// costs one fence on a path that already does a virtual call into SDL.
+std::atomic<Frontend::WindowSDL*> g_window{nullptr};
 
 namespace Libraries::GnmDriver { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
 namespace Libraries::AvPlayer { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
@@ -223,7 +228,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         auto* window = new Frontend::WindowSDL(width, height, title.c_str());
         {
             std::scoped_lock lock{g_window_mutex};
-            g_window = window;
+            g_window.store(window, std::memory_order_release);
             g_window_ready = true;
         }
         g_window_cv.notify_all();
@@ -297,7 +302,14 @@ static void KernelServiceThread(std::stop_token stoken) {
         if (stoken.stop_requested()) break;
         io_context.run();
         io_context.restart();
-        asio_requests = 0;
+        // Re-arm under the lock. Clearing it outside would lose a request that arrived while
+        // run() was executing: KernelSignalRequest bumps the counter under the lock, so a
+        // plain store racing that increment can overwrite it and the equeue timer would then
+        // never fire (wait() goes back to sleep on a zero counter).
+        {
+            std::unique_lock lock{m_asio_req};
+            asio_requests = 0;
+        }
     }
 }
 
@@ -333,15 +345,20 @@ extern "C" int bbgpu_overlay_captures_input(void) {
 }
 
 extern "C" int bbgpu_text_input_begin(const char* initial, const char* prompt) {
-    if (!g_window) return 0;
-    g_window->BeginTextInput(initial ? initial : "", prompt ? prompt : "Text");
+    // Single acquire load, then use that pointer: reading g_window twice could observe two
+    // different values. WindowSDL guards its own text state with text_mutex, and every SDL
+    // call inside is marshalled to the window thread, so no further locking is needed here.
+    Frontend::WindowSDL* const window = g_window.load(std::memory_order_acquire);
+    if (!window) return 0;
+    window->BeginTextInput(initial ? initial : "", prompt ? prompt : "Text");
     return 1;
 }
 
 extern "C" int bbgpu_text_input_poll(char* out, uint64_t size) {
-    if (!g_window) return 2;
+    Frontend::WindowSDL* const window = g_window.load(std::memory_order_acquire);
+    if (!window) return 2;
     std::string text;
-    const int state = g_window->PollTextInput(text);
+    const int state = window->PollTextInput(text);
     if (size) {
         const size_t n = std::min<size_t>(text.size(), size - 1);
         std::memcpy(out, text.data(), n);

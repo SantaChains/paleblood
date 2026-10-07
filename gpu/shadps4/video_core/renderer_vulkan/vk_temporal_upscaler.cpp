@@ -6,6 +6,7 @@
 #include "video_core/renderer_vulkan/ui_composition.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -243,6 +244,11 @@ void TemporalUpscaler::OnSceneColor(VideoCore::ImageId color) {
 }
 
 namespace {
+/// Capacity of the buffer holding the FSR 4 / DLSS problem message handed to the menu. The
+/// longest message a provider builds is well under this; the bound only guarantees the buffer
+/// the menu reads is always null-terminated.
+constexpr size_t kMaxProblemLen = 256;
+
 float Halton(u32 index, u32 base) {
     float f = 1.0f, result = 0.0f;
     for (u32 i = index; i > 0; i /= base) {
@@ -1952,18 +1958,25 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image 
         .auto_exposure = settings.fsr4_auto_exposure,
     };
     const bool ok = use_dlss ? dlss->Record(frame) : fsr4->Record(frame);
-    // The menu shows the reason; it outlives this frame (FSR 4 keeps its last message).
-    static std::string shown;
+    // The menu shows the reason and it outlives this frame (FSR 4 keeps its last message), so
+    // the published pointer must stay valid while the message does. The previous form copied
+    // into a std::array<std::string, 8> ring and published kept[next].c_str(): assigning into a
+    // reused slot can reallocate the string, leaving fsr4_problem dangling at freed memory that
+    // the present thread then reads. One fixed-size slot is enough — the value is only ever read
+    // between two Record calls, and it changes at most when the upscaler changes state, so
+    // there is nothing to gain from a ring and a stable address to lose.
+    static std::array<char, kMaxProblemLen> kept{};
     const char* problem = use_dlss ? dlss->Problem() : fsr4->Problem();
     if (!problem) {
         BbSettings::Get().fsr4_problem = nullptr;
-    } else if (shown != problem) {
-        shown = problem;
-        static std::array<std::string, 8> kept;
-        static u32 next = 0;
-        kept[next] = shown;
-        BbSettings::Get().fsr4_problem = kept[next].c_str();
-        next = (next + 1) % kept.size();
+    } else if (std::strncmp(kept.data(), problem, kMaxProblemLen - 1) != 0) {
+        // Bounded copy, always terminated: a message longer than the slot is truncated
+        // rather than left unterminated. The old length is kept when the new one is a prefix.
+        std::strncpy(kept.data(), problem, kMaxProblemLen - 1);
+        kept[kMaxProblemLen - 1] = '\0';
+    }
+    if (problem) {
+        BbSettings::Get().fsr4_problem = kept.data();
     }
     if (!ok && (use_dlss ? dlss->Fatal() : fsr4->Fatal())) {
         std::printf("Upscaler: falling back to FSR 3.1\n");

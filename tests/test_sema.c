@@ -4,6 +4,11 @@
 
 /* The settings menu of the GPU library restarts through probe.c, which tests do not link. */
 void runtime_restart(void) { abort(); }
+/* Same for the cheat code-cave writer (probe.c): runtime_cheats.c calls it, and this test
+ * links runtime_cheats.c transitively without exercising the cheat path. */
+int runtime_cheat_write(uint64_t offset, const void *data, uint64_t size) {
+    (void)offset; (void)data; (void)size; return 0;
+}
 #include <assert.h>
 #include <pthread.h>
 #include <stdint.h>

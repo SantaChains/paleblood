@@ -6,6 +6,7 @@
 #pragma once
 
 #include <atomic>
+#include <string>
 
 namespace BbSettings {
 
@@ -60,6 +61,16 @@ inline constexpr int OutputHeights[] = {720, 1080, 1440, 2160};
 inline constexpr int OutputCount = 4;
 inline constexpr int OutputDefault = 1; ///< 1920x1080, the game's own size
 
+/// Menu pages (BbOverlay::Page must stay in this order). The settings module needs the count
+/// to clamp ui_page, so it lives here rather than in the overlay.
+inline constexpr int UiPageCount = 5;
+
+/// Upper bound of gc_budget_mb, shared by the parser and the Advanced menu slider so the
+/// file and the UI cannot disagree. 16 GiB covers every current GPU; the effective budget is
+/// additionally clamped to the driver's live heapBudget in the texture cache, so a value
+/// above the device's real budget cannot push the thresholds past what it tolerates.
+inline constexpr int GcBudgetMaxMB = 16384;
+
 struct Values {
     std::atomic<int> upscaler{UpscalerFsr3};
     std::atomic<int> preset{NativeAA};
@@ -93,6 +104,9 @@ struct Values {
     std::atomic<int> display{-1};
     /// Overlay UI scale in percent (fixed menu steps); hot-applied.
     std::atomic<int> ui_scale{100};
+    /// Menu page open at start (0 graphics, 1 display, 2 effects, 3 cheats, 4 advanced), so
+    /// the menu reopens where it was left. Written on close like every other menu change.
+    std::atomic<int> ui_page{0};
     /// Present-path post chain (BbPost), hot-applied every frame. Each percent strength turns
     /// its effect off at 0, and the whole chain is bypassed when everything is 0.
     std::atomic<int> post_deband{50};    ///< f3kdb-style banding threshold strength, percent
@@ -141,6 +155,12 @@ struct Values {
 };
 
 Values& Get();
+
+/// Directory holding the user-owned files, derived from BB_CONFIG (the ini's own directory,
+/// trailing separator included). Falls back to the working directory when BB_CONFIG is unset.
+/// Every module that keeps a file next to bbport.ini — the ImGui layout ini, the style
+/// presets — resolves it through here so there is one definition of "the data directory".
+std::string DataDir();
 
 /// Reads the file, then the environment overrides. Called once at start.
 void Load();

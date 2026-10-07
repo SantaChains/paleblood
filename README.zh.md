@@ -11,7 +11,7 @@ bbport 将《血源诅咒》的 PlayStation 4 官方可执行文件直接运行�
 - 本项目仅供学习与技术研究，禁止用于商业用途。
 - 仓库不分发任何游戏文件、游戏资产、美术、字体或解密密钥。使用前必须自备合法获得的《血源诅咒》数字版 dump，版本 1.09。
 - 本项目与 Sony Interactive Entertainment、FromSoftware 无任何关联，Bloodborne 名称与相关商标归其权利人所有。
-- 社区补丁与作弊文件**不随仓库分发**——请从原作者处获取（见"Mod 与补丁"），启用前自行确认其内容。
+- 社区补丁与作弊文件**基本不随仓库分发**（唯一例外是启动必需的 patches\Bloodborne.xml）——其余请从原作者处获取（见"Mod 与补丁"），启用前自行确认其内容。
 - 因安装、使用本项目产生的任何直接或间接后果由使用者自行承担。
 
 ## 状态
@@ -28,7 +28,7 @@ bbport 将《血源诅咒》的 PlayStation 4 官方可执行文件直接运行�
   - FSR 4 INT8 与 FSR 4.1.1 INT8，需要 shader Float16、Int8/Int16、整数点积等 Vulkan 特性，不满足时启动前自动回退 FSR 3.1。
   - TAA，原生分辨率时域抗锯齿，可与 FSR 实时互切，锐度控制同样生效。
 - 多线程 GPU 命令处理。命令流在一个线程解码、另一个线程绑定与录制 draw，双阶段流水线随硬件线程数扩展，附带无进展看门狗。
-- 游戏内菜单：Insert 或 L3+R3 打开，含超分、预设、锐度、输出分辨率、画面效果、免费相机与作弊页。
+- 游戏内菜单：Insert 或 L3+R3 打开，含超分、预设、锐度、输出分辨率、画面效果、免费相机与作弊页。菜单的窗口位置与各折叠区展开状态会记住（bbport_ui.ini），选中的页也存在 bbport.ini（ui_page 键）；调色风格可存为具名槽位并随时召回（user-presets.json）。
 - 作弊引擎：直接读取 GoldHEN 与 shadPS4 格式的 JSON 补丁，原生内存写入，游戏的代码洞补丁原样生效。
 - Mod 支持：松散文件目录按加载顺序覆盖原文件，原始游戏不被修改。
 
@@ -70,7 +70,7 @@ AI 辅助安装（给 AI 助手照着做的配置清单）见 [docs/AI-SETUP.md]
 
 - language：告知游戏的 PS4 系统语言。11 简体中文，10 繁体中文，1 英语美国。1.09 dump 自带官方中文文本，无需额外 mod。
 - pad_swap：1 交换 A/B 与 X/Y 面键，适配报告 Nintendo 布局的手柄，如 Switch 模式的飞智；0 保持标准映射。
-- gc_budget_mb：纹理缓存预算，单位 MiB。内置默认 2515，对 8GB 显存偏紧，推荐 4096。
+- gc_budget_mb：纹理缓存预算，单位 MiB，0 为自动。自动模式取驱动的实时显存预算（`VK_EXT_memory_budget`，已扣除驱动自身保留，并会随其他程序占用收缩）；在驱动报告的预算上按 70% 开始回收、85% 加压、95% 激进。上限 16384。显存持续逼近临界线并逐出时，调高此项可换取更稳的帧时间。
 - present_mode：呈现模式。mailbox 默认低延迟，fifo 强制垂直同步，immediate 无同步。对应环境变量 BB_PRESENT_MODE。
 - fullscreen：1 为无边框全屏，与游戏内 F11 等效。
 - output_res：输出分辨率，如 3840x2160；与 preset 配合决定渲染分辨率补丁。
@@ -88,6 +88,8 @@ AI 辅助安装（给 AI 助手照着做的配置清单）见 [docs/AI-SETUP.md]
 | Mod（每子目录一个）                 | mods\                             | BB_MODS_DIR             |
 | 作弊 JSON（GoldHEN / shadPS4 格式） | cheats\                           | BB_CHEATS_DIR           |
 | 存档                                | user\                             | BB_USER_DIR             |
+| 界面布局（窗口几何、折叠态）        | bbport_ui.ini                     | 随 BB_CONFIG            |
+| 自定义调色风格                      | user-presets.json                 | 随 BB_CONFIG            |
 | nvngx_dlss.dll                      | 可执行文件同目录                  | BB_DLSS_DIR             |
 | FSR 4.1.1 资产                      | fsr4_411\                         | BB_FSR411_DIR           |
 | 设置                                | bbport.ini                        | BB_CONFIG               |
@@ -113,7 +115,8 @@ AI 辅助安装（给 AI 助手照着做的配置清单）见 [docs/AI-SETUP.md]
 
 - Mod：mods\ 下每个子目录为一个 mod，可含 dvdroot_ps4\、一层包装目录或直接是 chr\ 等游戏目录；文件名大小写不敏感，后加载覆盖先加载。启停与顺序编辑数据目录的 mods.json（`{"order": [...], "disabled": [...]}`），新目录自动启用。详见 [docs/MODS.md](docs/MODS.md)。
 - 补丁：patches\ 下放置 shadPS4 格式 XML，启动时编译进 patches.bin。帧率、渲染分辨率、画面效果开关均走此通道。
-- **社区补丁不随本仓库分发。**请从原作者或社区补丁库（如 [GoldHEN](https://github.com/GoldHEN) 补丁合集）下载 XML 放入 patches\。补丁版权归 Kyo、Lance McDonald、auser1337、illusion、emoose 等社区成员所有。
+- **patches\Bloodborne.xml 随仓库分发，是启动必需**（缺失时 patches.py 直接失败）。它是移植的内置补丁库，条目源自 [ps4_cheats](https://github.com/shadps4-emu/ps4_cheats) 的 PATCHES/Bloodborne.xml 并含本地修正（如补齐 messengers 与加载画面的timestep），补丁名与 patches.py 的 FPS_PRESETS、EFFECTS 对应。
+- **其余社区补丁不随仓库分发。**patches\GoldHEN\ 与 patches\shadPS4\ 两个子目录（以及你自己放入的任何文件）不在版本控制内，请从原作者或社区补丁库（如 [GoldHEN](https://github.com/GoldHEN) 补丁合集）获取。补丁版权归 Kyo、Lance McDonald、auser1337、illusion、emoose 等社区成员所有。
 
 ## 常用环境变量
 
@@ -156,7 +159,7 @@ GTK4 启动器、AppImage 打包与 Steam Deck 细节见 launcher\、packaging\ 
 - src\：加载器 probe.c 与 HLE 运行时 runtime_*.c；Windows 专属实现在 win32_*.c 与 host_sync.h。
 - scripts\：游戏映像离线准备、模块链接、补丁编译器、Windows 启动器 run_windows.py。
 - gpu\：渲染库。vendored 的 shadPS4 视频核加本项目改动，含 ImGui 菜单、DLSS/FSR、双阶段绘制管线与帧捕获。
-- patches\：社区补丁 XML 放这里（不随仓库分发）。
+- patches\：内置的 Bloodborne.xml（启动必需，随仓库分发），以及放自己社区补丁 XML 的目录（GoldHEN\、shadPS4\ 两个子目录不在版本控制内）。
 - tools\：开发与测量工具。
 - tests\：加载器、运行时、补丁与渲染测试，bash build.sh --test 运行。
 - documents\：中文文档，设计评审 design-review.zh.md、代码质量审查 quality-review.zh.md、开发者指南 dev-guide.zh.md。

@@ -1,3 +1,17 @@
+# Declared for provenance only — these are NOT initialised as submodules.
+#
+# All three trees are committed into this repository as ordinary files (no 160000 gitlink
+# entries exist; `git submodule status` reports nothing). This file therefore records where
+# each vendored snapshot came from, not a clone-time fetch step: `git clone --recursive`
+# fetches nothing for them.
+#
+#   fsr-vulkan — LOCAL CHANGES present (gpu/third_party/fsr-vulkan/src/ffx_vk_fsr4_v07.c
+#                carries "bbport:" markers for BB_FSR4_PROFILE and BB_FSR4_STATS), so it can
+#                never be a clean submodule. Kept inline deliberately.
+#   imgui      — no local changes found; a real submodule would still fit. Not converted.
+#   LibAtrac9  — no local changes found; same.
+#
+# Divergences from upstream are tracked in gpu/VENDOR.txt.
 [submodule "gpu/third_party/fsr-vulkan"]
 	path = gpu/third_party/fsr-vulkan
 	url = https://github.com/FireBurn/FSR-Vulkan.git

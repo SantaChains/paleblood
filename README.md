@@ -11,7 +11,7 @@ The `windows-port` branch is the native Windows version; it adds NVIDIA DLSS ups
 - This project is for learning and technical research only. Commercial use is prohibited.
 - The repository distributes **no game files, no game assets, no artwork, no fonts and no decryption keys**. You must supply a legally obtained dump of your own copy of *Bloodborne* (digital version, patch 1.09).
 - This project is not affiliated with Sony Interactive Entertainment or FromSoftware. *Bloodborne* and all related trademarks belong to their respective owners.
-- Community patches and cheat files are **not bundled** — download them from their original authors (see *Mods and patches* below) and review their contents before enabling.
+- Community patches and cheat files are **mostly not bundled** — `patches\Bloodborne.xml` (required to start) is the sole exception; download the rest from their original authors (see *Mods and patches* below) and review their contents before enabling.
 - Use of this project is at your own risk; the authors are not responsible for any consequences.
 
 ## Status
@@ -70,7 +70,7 @@ For an AI-assisted setup (a checklist an AI assistant can follow to configure ev
 
 - language: PS4 system language reported to the game. 11 = Simplified Chinese, 10 = Traditional Chinese, 1 = English (US). The 1.09 dump ships official Chinese text; no mod needed.
 - pad_swap: 1 swaps A/B and X/Y for pads that report the Nintendo layout (e.g. Flydigi in Switch mode); 0 keeps standard mapping.
-- gc_budget_mb: texture cache budget in MiB. Built-in default 2515 is tight for 8 GB cards; 4096 recommended.
+- gc_budget_mb: texture cache budget in MiB, 0 = automatic. Automatic follows the driver's live budget (`VK_EXT_memory_budget`, already net of the driver's own reservations, shrinking when other processes take VRAM); thresholds sit at 70% / 85% / 95% of it. Cap 16384. Raise it if memory keeps hovering at the critical mark and evicting.
 - present_mode: `mailbox` (default, low latency), `fifo` (forced VSync), `immediate` (no sync). Env: `BB_PRESENT_MODE`.
 - fullscreen: 1 = borderless fullscreen, same as F11 in-game.
 - output_res: output resolution, e.g. 3840x2160; combined with preset it drives the render-resolution patch.
@@ -113,7 +113,8 @@ Rules: files whose `process` is not `eboot.bin` or whose `id` mismatches the gam
 
 - Mods: each subdirectory of `mods\` is one mod, containing `dvdroot_ps4\`, a single wrapper directory, or game directories like `chr\` directly. Filenames are case-insensitive; later loads override earlier ones. To enable/disable or reorder mods, edit `mods.json` in the data directory (`{"order": [...], "disabled": [...]}`); new folders are enabled automatically. Details in [docs/MODS.md](docs/MODS.md).
 - Patches: shadPS4-format XML placed in `patches\` is compiled into `patches.bin` at launch. Frame-rate unlock, render resolution and effect toggles all go through this channel.
-- **Community patches are not distributed in this repository.** Download them from their original authors or community patch repositories (e.g. the [GoldHEN](https://github.com/GoldHEN) patch collection) and drop the XML into `patches\`. Patch credits belong to Kyo, Lance McDonald, auser1337, illusion, emoose and other community members.
+- **`patches\Bloodborne.xml` is bundled and required** — `patches.py` fails without it. It is the port's built-in patch database: its entries derive from [ps4_cheats](https://github.com/shadps4-emu/ps4_cheats) `PATCHES/Bloodborne.xml` with local corrections (missing timesteps on the messengers and loading-screen animations were filled in), and its patch names line up with `FPS_PRESETS` and `EFFECTS` in `patches.py`.
+- **Other community patches are not distributed in this repository.** The `patches\GoldHEN\` and `patches\shadPS4\` subdirectories — and anything you drop in yourself — are outside version control; download from the original authors or community patch repositories (e.g. the [GoldHEN](https://github.com/GoldHEN) patch collection). Patch credits belong to Kyo, Lance McDonald, auser1337, illusion, emoose and other community members.
 
 ## Useful environment variables
 
@@ -156,7 +157,7 @@ GTK4 launcher, AppImage packaging and Steam Deck details in `launcher\`, `packag
 - `src\`: the loader (probe.c) and HLE runtime (runtime_*.c); Windows-specific code in win32_*.c and host_sync.h.
 - `scripts\`: offline game-image preparation, module linking, the patch compiler, and the Windows launcher run_windows.py.
 - `gpu\`: the rendering library — vendored shadPS4 video core plus this project's changes: ImGui menu, DLSS/FSR, two-stage draw pipeline, frame capture.
-- `patches\`: place community patch XML here (not bundled with the repository).
+- `patches\`: the built-in `Bloodborne.xml` plus a drop directory for your own community patch XML (the `GoldHEN\` and `shadPS4\` collections are not in version control).
 - `tools\`: development and measurement tools.
 - `tests\`: loader, runtime, patch and rendering tests — `bash build.sh --test`.
 - `documents\`: Chinese-language docs — design review, quality review, developer guide.

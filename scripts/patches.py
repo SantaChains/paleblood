@@ -290,7 +290,6 @@ def main():
     p.add_argument('--settings',type=Path,default=Path(__file__).resolve().parent.parent/'bbport.ini')
     p.add_argument('--game-dir',type=Path,default=Path(os.environ.get('BB_GAME_DIR','../CUSA03173')))
     p.add_argument('--render-res',default='',help='render resolution WxH (overrides the preset)')
-    p.add_argument('--print-preset-size',action='store_true',help='print the selected preset size, if reduced')
     p.add_argument('--output-res',default='',help='output resolution WxH (the upscaler\'s; the UI stays 1920x1080)')
     p.add_argument('--print-scaled',action='store_true',
                    help='print "RENDER OUTPUT" (WxH) when bbport.ini selects an output other than 1080p')
@@ -298,15 +297,6 @@ def main():
     if a.print_scaled:
         sizes=scaled_sizes(read_settings(a.settings))
         if sizes: print(f'{sizes[0][0]}x{sizes[0][1]} {sizes[1][0]}x{sizes[1][1]}')
-        return
-    if a.print_preset_size:
-        settings=read_settings(a.settings)
-        if 'BB_UPSCALER' in os.environ:
-            settings['upscaler']='fsr3' if os.environ['BB_UPSCALER']=='fsr3' else 'off'
-        if 'BB_UPSCALE_PRESET' in os.environ:
-            settings['preset']=os.environ['BB_UPSCALE_PRESET']
-        size=render_size(settings)
-        if size: print(f'{size[0]}x{size[1]}')
         return
     # A compile takes well under a second but runs at every launch: reuse patches.bin while
     # the stamp matches. A failed compile leaves no stamp, so the next launch retries.

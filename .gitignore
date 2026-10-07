@@ -3,6 +3,12 @@ __pycache__/
 user/
 *.mp4
 bbport.ini
+# Runtime UI state written next to bbport.ini (BB_CONFIG base): overlay window geometry,
+# selected tab, collapsing-header states, and the user's saved colour-grade slots.
+bbport_ui.ini
+bbport_ui.ini.*
+user-presets.json
+user-presets.json.*
 fsr4_shaders/
 pgo/
 *.png
@@ -35,8 +41,23 @@ steam_appid.txt
 
 imgui-liquid-glass/
 
+# Local tooling / assistant workspace: never part of the source tree.
+/.workbuddy/
+/.claude/
+/.cursor/
+*.code-workspace
+result
+result-*
+.direnv/
+
 # Publication hygiene: user-supplied game content, vendor binaries and Sony-owned art never enter the repo
-/patches/
+#
+# patches/ needs two rules, not one. Bloodborne.xml directly under it is the port's built-in
+# patch database (scripts/patches.py defaults --xml to it and refuses to start without it),
+# and its patch lists carry local corrections on top of shadps4-emu/ps4_cheats, so it must be
+# tracked. The GoldHEN/ and shadPS4/ subdirectories are unmodified third-party collections and
+# stay out. Matching "/patches/*/" rather than "/patches/" keeps both facts in one place.
+/patches/*/
 /dumps/
 /savedata/
 /sys_modules/

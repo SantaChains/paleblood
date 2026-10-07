@@ -1125,26 +1125,36 @@ TextureCache::GcStats TextureCache::GetGcStats() const {
 void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
-        // bbport: on integrated GPUs (Steam Deck) the usage covers system-memory heaps holding
-        // much more than images (buffers backing guest memory), and the startup budget left
-        // ~1 GB after its 8 GB system reserve: usage stayed above the critical mark, so the
-        // collector evicted images used two or three frames ago on every submission and wrote
-        // GPU-written ones back. Compare with the driver's current budget instead.
-        // BB_GC_BUDGET_MB=N (ini gc_budget_mb=, the Advanced menu): a fixed budget on any
-        // GPU (tests on a desktop), 0 = the driver's live budget.
+        // bbport: compare against the driver's *live* budget, not the startup one.
+        //
+        // Why all GPUs and not only integrated ones: the startup budget (GetTotalMemoryBudget)
+        // subtracts an extra system reserve (1/8 of the heap, capped at 1 GB) on top of what the
+        // driver already holds back, and it is computed once. On a discrete card whose working
+        // set is larger than that reserve, the derived critical mark lands *below* the game's
+        // real footprint: usage then never drops under it, every pass evicts images the game
+        // re-touches within 80 ticks, and the write-back churn eventually trips
+        // eErrorDeviceLost at the submit in Scheduler::SubmitExecution. Measured on an 8 GB
+        // AMD card: critical 5031 MiB against a 5050 MiB working set, thousands of evictions
+        // per report, then "Device lost during submit".
+        //
+        // VK_EXT_memory_budget's heapBudget is "what the driver currently lets this process
+        // allocate, other processes included" (VkPhysicalDeviceMemoryBudgetPropertiesEXT) —
+        // already net of the driver's own reservations, and it shrinks when someone else takes
+        // VRAM, which is exactly when we want to back off. It is a guideline, not a promise,
+        // so eOutOfDeviceMemory stays handled.
+        //
+        // BB_GC_BUDGET_MB=N (ini gc_budget_mb=, the Advanced menu) still forces a fixed budget,
+        // but never above the driver's live one: a larger value would only move the thresholds
+        // past what the device actually tolerates.
         const int budget_mb = BbSettings::Get().gc_budget_mb.load();
         const u64 forced_budget = budget_mb > 0 ? u64(budget_mb) << 20 : 0;
-        if (instance.IsIntegrated() || forced_budget) {
-            // bbport: the driver's live budget is the authority; a forced budget beyond it
-            // would only move the thresholds past what the device actually tolerates.
-            const u64 driver = instance.GetDeviceMemoryBudgetNow();
-            const u64 budget =
-                forced_budget ? (driver && driver < forced_budget ? driver : forced_budget) : driver;
-            if (budget != 0) {
-                trigger_gc_memory = budget / 10 * 7;
-                pressure_gc_memory = budget / 100 * 85;
-                critical_gc_memory = budget / 100 * 95;
-            }
+        const u64 driver = instance.GetDeviceMemoryBudgetNow();
+        const u64 budget =
+            forced_budget ? (driver && driver < forced_budget ? driver : forced_budget) : driver;
+        if (budget != 0) {
+            trigger_gc_memory = budget / 10 * 7;
+            pressure_gc_memory = budget / 100 * 85;
+            critical_gc_memory = budget / 100 * 95;
         }
     }
     gc_stats_pub.store({total_used_memory, pressure_gc_memory, critical_gc_memory,

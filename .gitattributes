@@ -1,2 +1,12 @@
 # cmd.exe needs CRLF batch files
 *.bat text eol=crlf
+
+# SPIR-V is binary and happens to contain CR bytes (fsr3_3_1_5_accumulate.spv: 24 of them).
+# core.autocrlf=true on Windows would otherwise be free to rewrite them; git only avoids it
+# today through the contains-NUL heuristic, which is not a contract.
+*.spv binary
+
+# Images and other opaque payloads.
+*.png binary
+*.jpg binary
+*.ico binary

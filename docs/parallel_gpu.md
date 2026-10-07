@@ -1,578 +1,551 @@
-# Parallel GPU command processing — design notes
+# 并行 GPU 命令处理 — 设计笔记
 
-Goal: remove the single-core bottleneck of the emulated GPU command processor
-(`shadPS4:GpuCommandProcessor`, ~100% of one core while the rest of the CPU idles).
+目标：消除模拟 GPU 命令处理器（`shadPS4:GpuCommandProcessor`）的单核瓶颈
+（它占满一个核约 100%，而 CPU 其余部分闲置）。
 
-## Measurements (Bloodborne, Hunter's Nightmare, ~70 FPS, `BB_DCB_STATS=1`)
+## 测量（Bloodborne，猎人噩梦，约 70 FPS，`BB_DCB_STATS=1`）
 
 | | |
 |---|---|
-| Graphics command buffers submitted | 4200–5800/s, **~65–80 per frame** |
-| Draws | ~110 000/s, ~1600 per frame |
-| Draws per command buffer | mostly 10–99, max ~200 |
-| Nested IndirectBuffer | none |
-| State before the first draw | ~118 context + ~31 SH register dwords written; only 8% start with ClearState |
+| 提交的图形命令缓冲 | 4200–5800/s，**每帧约 65–80 个** |
+| draw | 约 110 000/s，每帧约 1600 个 |
+| 每个命令缓冲的 draw 数 | 多数10–99，最多约 200 |
+|嵌套 IndirectBuffer | 无 |
+| 首个 draw 之前的状态 | 写入约 118 个 context + 约 31 个 SH 寄存器 dword；仅 8% 以 ClearState 开始 |
 
-GPU thread profile after the single-thread work (perf, `cpu-clock:u`):
-texture binding ~25%, pipeline selection ~19% (StageSpecialization build/compare,
-sharp fetches), buffer binding ~14%, render targets ~8%, PM4 decode ~3%.
+单线程工作做完后的 GPU 线程剖析（perf，`cpu-clock:u`）：
+纹理绑定约 25%，管线选择约 19%（StageSpecialization 构建/比较、
+sharp fetch），缓冲绑定约 14%，渲染目标约 8%，PM4 解码约 3%。
 
-## Constraints
+## 约束
 
-- Command buffers are not self-contained: register state is inherited, so a worker needs
-  the register state at the start of its buffer (context + SH ranges are ~6–8 KiB; one
-  snapshot per buffer is ~40 MB/s at 70 FPS).
-- Draw preparation reads guest memory, not only registers: extended user data (EUD) and
-  shader code. Earlier packets in the stream (DMA, WriteData, constant-engine dumps) can
-  change that memory, so work done ahead of the GPU thread may see stale data.
-- The caches (buffer, texture, pipeline) and per-draw scratch state (flags in `Image`,
-  user data inside shared `Shader::Info`) are single-threaded by design.
-- Image layout and barrier tracking assume one ordered stream.
+- 命令缓冲不是自包含的：寄存器状态是继承的，因此 worker 需要其缓冲起始处的
+  寄存器状态（context + SH 范围约 6–8 KiB；70 FPS 下每缓冲一份快照约 40 MB/s）。
+- draw 准备读取的不只是寄存器，还有客户内存：扩展用户数据（EUD）与 shader 代码。
+  流中更早的包（DMA、WriteData、常量引擎 dump）可能改动那段内存，因此抢在 GPU
+  线程之前完成的工作可能看到过期数据。
+- 各缓存（buffer、texture、pipeline）与每 draw 的暂存状态（`Image` 里的标志位、
+  共享 `Shader::Info` 内的用户数据）设计上就是单线程的。
+- 图像布局与 barrier 跟踪假定只有一条有序流。
 
-## Plan
+## 方案
 
-1. **Speculative draw preparation on workers, validated on the GPU thread.**
-   A cheap serial pass records the register state at the start of each command buffer.
-   Workers replay their buffer's register writes and, per draw, precompute the pure
-   parts: pipeline key and stage specialization inputs, sharp fetches, texture and
-   render-target descriptions, dynamic state values, vertex buffer ranges. Each result
-   carries the flattened user data it was computed from. The GPU thread still decodes
-   the stream and refreshes the flattened user data (cheap), compares it with the
-   worker's copy, and uses the prepared draw only on a match; otherwise it computes
-   as today. Correctness never depends on the workers.
-   Prerequisite refactor: sharp consumers read user data through a view instead of
-   the shared `Shader::Info` members, and per-draw scratch moves into a context struct.
-2. **Thread-safe cache lookups.** Finding existing buffers/images/views moves to the
-   workers; creation, uploads, barriers stay on the GPU thread.
-3. **Parallel Vulkan recording.** Each worker records its own command buffer; they are
-   executed in submission order with barriers at the seams.
+1. **在worker 上做推测性 draw 准备，在 GPU 线程上验证。**
+   一趟廉价串行处理记录每个命令缓冲起始处的寄存器状态。worker 重放自己缓冲的
+   寄存器写入，并逐 draw 预计算纯函数部分：管线键与 stage 特化输入、sharp fetch、
+   纹理与渲染目标描述、动态状态值、顶点缓冲范围。每个结果都带上它据以计算的
+   扁平化用户数据。GPU 线程仍然解码流并刷新扁平化用户数据（廉价），与worker
+   的副本比对，仅在匹配时使用预备好的 draw；否则照今天的方式自行计算。
+   正确性从不依赖 worker。
+   前置重构：sharp 消费方改为通过视图读取用户数据，而非共享的 `Shader::Info`
+   成员；每 draw 暂存移入一个上下文结构。
+2. **线程安全的缓存查找。** 查找已有 buffer/image/view 移到 worker；创建、上传、
+   barrier 仍留在 GPU 线程。
+3. **并行 Vulkan 录制。** 每个 worker 录制自己的命令缓冲；它们按提交顺序执行，
+   接缝处放barrier。
 
-Every step keeps a `BB_TOGGLE_FILE` bit so it can be switched off at run time and
-compared by screenshot and frame rate.
+每一步都保留一个 `BB_TOGGLE_FILE` 位，以便运行时关闭，并通过截图与帧率对比。
 
-## Portability
+## 可移植性
 
-Must scale down to the Steam Deck (4 cores / 8 threads): worker count follows
-`hardware_concurrency()`, no busy waiting when cores are scarce, no AVX-512.
+必须能降级到 Steam Deck（4 核 / 8 线程）：worker 数跟随
+`hardware_concurrency()`，核少时不忙等，不用 AVX-512。
 
-## Results
+## 结果
 
-Step 1 (draw preparation, 4 workers, toggle 8192), Hunter's Nightmare, same view:
-71.5 FPS with prepared draws vs 64.1 without (+11.5%), identical screenshots.
-97–98% of direct draws use the prepared pipeline; each `bb:DrawPrep` worker ~10% of a core.
-The GPU thread is still ~90% busy: texture/buffer binding is the next target (step 2).
+第1 步（draw 准备，4 个 worker，toggle 8192），猎人噩梦，同一视角：
+启用预备 draw 为 71.5 FPS，禁用为 64.1 FPS（+11.5%），截图完全一致。
+97–98% 的直接 draw 使用预备管线；每个 `bb:DrawPrep` worker 约占一个核的 10%。
+GPU 线程仍约 90% 忙碌：纹理/缓冲绑定是下一个目标（第 2 步）。
 
-Guest write faults (same view, toggle 65536): the game fills its per-frame buffers
-sequentially and each 4 KiB page cost a protection fault — ~115k faults/s, ~20% of every
-GXWorker and of the main thread spent in the kernel. Unprotecting the aligned 64 KiB window
-around a fault: 16k faults/s, kernel time ~8%, **81.0 FPS vs 66.4** (+22%), identical frames.
-The GPU command thread is back at ~100%: it is the limit again.
+客户写故障（同一视角，toggle 65536）：游戏顺序填充其每帧缓冲，每 4 KiB 页都
+产生一次保护故障 —— 约 115k 故障/s，每个 GXWorker 与主线程约 20% 的时间耗在内核里。
+把故障点周围对齐的 64 KiB 窗口解除保护后：16k 故障/s，内核时间约 8%，
+**81.0 FPS 对 66.4 FPS**（+22%），画面完全一致。
+GPU 命令线程回到约 100%：它再次成为瓶颈。
 
-Rejected: "hot pages" (never re-protect pages written repeatedly, upload them on every
-binding) — the set grew to ~14k pages, re-uploads dropped the frame rate to 33 FPS and a GPU
-ring timeout followed. Left opt-in behind BB_HOT_PAGES=1.
+已否决：「热页」（对反复写入的页永不重新保护，每次绑定时上传）—— 该集合增长到
+约 14k 页，重传把帧率压到 33 FPS，随后 GPU 环形缓冲超时。
+保留在 `BB_HOT_PAGES=1` 后面作为可选项。
 
-Texture description cache 2-way/4096, same-target fast path, LRU touch skip, no per-texture
-meta lookup: other outdoor view, 93.9 FPS; with the texture memos off (mask 1056) 65.6 FPS.
-Close to the 100 Hz display cap (vblank-paced), so further gains need an uncapped test.
+纹理描述缓存 2 路/4096 项、同目标快路径、LRU触碰跳过、无每纹理元数据查找：
+另一处室外视角 93.9 FPS；关掉纹理 memo（mask 1056）为 65.6 FPS。
+已接近 100 Hz 显示上限（受 vblank 节拍），因此进一步收益需要不限帧的测试。
 
-## Streaming stutter (BB_FRAME_STATS "Stall:" lines)
+## 流式加载卡顿（`BB_FRAME_STATS` 的「Stall:」行）
 
-Running through new areas gave 60–170 ms frames (also in shadPS4). The GPU thread was busy
-the whole frame, mostly in the kernel, uploading 50–400 MB of textures and buffers per frame.
-Findings, in the order they were fixed:
+跑过新区域时出现 60–170 ms 的帧（shadPS4 中同样有）。GPU 线程整帧忙碌，
+大部分在内核里，每帧上传 50–400 MB 的纹理与缓冲。按修复顺序列出发现：
 
-1. Guest-to-staging copies ran on one thread (the recording thread, textures on the GPU
-   thread). They now start at once on copy threads (`BbCopy::Async`, `bbport_copy.cpp`);
-   small copies are batched per thread (one wakeup per ~512 KiB — one per copy cost 25% FPS).
-   Guest-visible fences and queue submission wait for them (`Scheduler::WaitHostCopies`),
-   which keeps the fix for UI flicker (the guest reused buffers before deferred copies ran).
-2. Copies then ran at 0.2–0.4 GB/s per thread, almost all in the kernel: the first CPU access
-   to a new staging block makes the kernel allocate and clear it (~2 ms per 16 MiB), and the
-   staging pool freed blocks after 3 s idle, between streaming bursts. It now keeps 512 MiB
-   (`BB_STAGING_KEEP_MB`), frees the rest after 30 s and populates 128 MiB at startup.
-3. Write faults: a 256 KiB unprotect window (`BB_FAULT_WINDOW`) halves them again.
-   `BB_UFFD=1` tracks writes with userfaultfd write-protection instead of mprotect (no
-   address-space write lock, no mapping splits); read protection for readbacks still uses
-   mprotect. It removes the mprotect time but did not change the stalls measurably; opt-in.
-4. File reads into write-protected guest pages failed with EFAULT (kernel copies do not reach
-   the fault handler); reads now touch each destination page first.
+1. 客户到staging 的拷贝原先跑在一个线程上（录制线程跑纹理，GPU 线程跑其余）。
+   现在它们同时在拷贝线程上启动（`BbCopy::Async`，`bbport_copy.cpp`）；
+   小拷贝按线程批量合并（每约 512 KiB 唤醒一次 —— 每次拷贝唤醒一次要付 25% FPS）。
+   客户可见的fence 与队列提交会等它们（`Scheduler::WaitHostCopies`），
+   这保留了对 UI 闪烁的修复（客户在延迟拷贝执行前就复用了缓冲）。
+2. 拷贝随后每线程只跑到 0.2–0.4 GB/s，几乎全耗在内核：CPU 首次访问新的
+   staging 块会让内核分配并清零它（每 16 MiB 约 2 ms），而 staging 池会在
+   空闲 3 s 后释放块，正好卡在流式突发之间。现在保留 512 MiB
+   （`BB_STAGING_KEEP_MB`），其余在 30 s 后释放，启动时预填 128 MiB。
+3. 写故障：256 KiB 的解除保护窗口（`BB_FAULT_WINDOW`）再次把它们减半。
+   `BB_UFFD=1` 用userfaultfd 写保护而非 mprotect 跟踪写入（无需地址空间写锁、
+   无映射分裂）；回读用的读保护仍用 mprotect。它省掉了 mprotect 时间，
+   但未可测量地改变卡顿；可选项。
+4. 读文件到受写保护的客户页曾以 EFAULT 失败（内核拷贝不会进入缺页处理）；
+   现在读取会先触碰每个目标页。
 
-Result: stalls are mostly 40–50 ms (GPU thread ~30 ms of draw work plus ~12 ms of copies)
-instead of 60–170 ms; the area load frame 350 ms instead of 430–760 ms.
+结果：卡顿大多降到 40–50 ms（GPU 线程约 30 ms draw 工作加约 12 ms 拷贝），
+不再是 60–170 ms；区域加载那一帧 350 ms，而非 430–760 ms。
 
-## Step 2, first slice: resource sharps on the workers (2026-09-30)
+## 第 2 步第一刀：worker 上的资源 sharp（2026-09-30）
 
-A prepared stage now also carries the sharps its worker read from the flattened user data:
-every T# with its texture-description hash, every S# and V# (`PrepareResources`,
-`PreparedStage::image_sharps` and siblings, in the arena of the submission). The GPU thread
-uses them when `PipelineCache::UsedPrepared()` reports that the draw's pipeline came from the
-prepared draw — the flattened data was then compared word for word, and sharps depend on
-nothing else. Resource list sizes are checked per stage. Toggle 4096 switches it off.
+预备好的 stage 现在也携带其 worker 从扁平化用户数据读到的 sharp：
+每个 T# 及其纹理描述哈希、每个 S# 与 V#（`PrepareResources`、
+`PreparedStage::image_sharps` 及其同类，位于该次提交的 arena 中）。当
+`PipelineCache::UsedPrepared()` 报告该 draw 的管线来自预备 draw 时，GPU 线程
+就使用它们 —— 此时扁平化数据已逐字比对过，而 sharp 不依赖其他任何东西。
+资源列表大小按 stage 检查。toggle 4096 可关闭。
 
-A/B in one run, standing still, `BB_FPS_LIMIT=0`, FSR 4, 20 s phases: 69–70 FPS with the
-prepared sharps, 66.5–67 without (+3%), same image.
+一次运行内 A/B，静止，`BB_FPS_LIMIT=0`，FSR 4，各阶段 20 s：
+启用预备 sharp 为 69–70 FPS，禁用为 66.5–67 FPS（+3%），画面相同。
 
-Upscaler costs removed from the GPU thread before this (perf, DWARF call graphs): per-draw
-driver format queries in `SceneTargets::Eligible` (~13%), direct recording forced by
-`CommandBuffer()` in object motion and the reactive mask, index-list scans for object motion
-(~10%, now `Motion::IndexRangeCache`).
+在此之前已从 GPU 线程移除的超分开销（perf，DWARF 调用图）：`SceneTargets::Eligible`
+中逐 draw 的驱动格式查询（约 13%）、物体运动与反应性 mask 中 `CommandBuffer()`
+强制直接录制、物体运动的索引列表扫描（约 10%，现为 `Motion::IndexRangeCache`）。
 
-What remains on the GPU thread is mostly work on shared cache state: texture binding ~23%
-(FindView ~5.6%, UpdateImage/Track/Touch ~5%, barriers), buffer binding ~12% (ObtainBuffer
-~11%), render targets ~8%. The next step is a draw-level split: the GPU thread keeps decode,
-cache mutation and barriers; a second ordered stage builds descriptor writes and vertex
-input state from the resolved handles.
+GPU 线程上剩下的主要是共享缓存状态上的工作：纹理绑定约 23%
+（FindView 约 5.6%、UpdateImage/Track/Touch 约 5%、barrier），缓冲绑定约 12%
+（ObtainBuffer 约 11%），渲染目标约 8%。下一步是 draw 级拆分：GPU 线程保留解码、
+缓存变更与 barrier；第二个有序 stage 从已解析出的 handle 构建描述符写入与顶点输入状态。
 
-## Scaling to the available threads (2026-09-30)
+## 扩展到可用线程数（2026-09-30）
 
-Draw preparation used to replay the whole command stream in every worker and was switched
-off below 12 hardware threads (Steam Deck: no workers). Now:
+draw 准备原先在每个 worker 上重放整条命令流，并在硬件线程数低于 12 时被关闭
+（Steam Deck：无 worker）。现在：
 
-- One scanner (`bb:DrawScan`) replays the register writes in order and stores, per buffer,
-  its starting checksum and a delta of the 32-word register blocks it wrote
-  (`AmdGpu::RegDirty/RegDelta`, recorded by `ApplyGraphicsRegisterPacket`).
-- Workers (`bb:DrawPrepN`, half the hardware threads in the affinity mask, 1..8) claim the
-  nearest scanned buffer ahead of the GPU thread, reach its starting state by applying the
-  deltas since their last buffer (or from the queue's tail state), and prepare its draws.
-  More workers now mean more buffers prepared in parallel, not more duplicated replay.
-- All helpers are SCHED_IDLE (`bbport_threads.h`): they only take idle cores. If the scanner
-  starves (busy CPU), the GPU thread rebases it from its own register state once the lag
-  passes 64 buffers instead of queueing without bound (`scanner rebases` in the stats).
-- Copy threads use the same affinity count (critical path, normal priority).
+- 一个扫描器（`bb:DrawScan`）按序重放寄存器写入，并为每个缓冲记录其起始校验和
+  以及它写入的 32 字寄存器块的增量（`AmdGpu::RegDirty/RegDelta`，由
+  `ApplyGraphicsRegisterPacket` 记录）。
+- worker（`bb:DrawPrepN`，亲和性掩码中一半的硬件线程，1..8）抢在 GPU 线程之前
+  认领最近的已扫描缓冲，通过应用自上一个缓冲以来的增量（或从队列尾部状态起）
+  到达其起始状态，然后准备其中的 draw。worker 变多意味着并行准备的缓冲变多，
+  而非重放次数变多。
+- 所有辅助线程都是 SCHED_IDLE（`bbport_threads.h`）：只占用空闲核。若扫描器
+  饥饿（CPU 繁忙），GPU 线程在滞后超过 64 个缓冲时从自己的寄存器状态重新定基，
+  而不是无界排队（统计中的 `scanner rebases`）。
+- 拷贝线程使用同样的亲和线程数（关键路径，普通优先级）。
 
-A/B in one run (toggle 8192, standing still, `BB_FPS_LIMIT=0`, FSR 4), ~98% of direct draws
-prepared, no rebases:
+一次运行内 A/B（toggle 8192，静止，`BB_FPS_LIMIT=0`，FSR 4），约 98% 的直接
+draw 已预备，无 rebase：
 
-| CPU | with preparation | without |
+| CPU | 启用准备 | 禁用 |
 |---|---|---|
-| 16 threads, 8 workers | ~74 FPS | ~57.7 FPS |
-| `taskset -c 0-3,8-11` (4 cores / 8 threads, Deck-like), 4 workers | ~68 FPS | ~53 FPS |
+| 16 线程，8 worker | 约 74 FPS | 约 57.7 FPS |
+| `taskset -c 0-3,8-11`（4 核 / 8 线程，类 Deck），4 worker | 约 68 FPS | 约 53 FPS |
 
-The previous design (4 replaying workers) gave ~69 FPS at the same spot on 16 threads, and
-none on 8.
+旧设计（4 个重放型 worker）在 16 线程的同一位置给约 69 FPS，在 8 线程上完全没有收益。
 
-## Vertex inputs on the workers (2026-09-30)
+## worker 上的顶点输入（2026-09-30）
 
-`PreparedDraw::vertex` holds, for the dynamic vertex input path, the attribute and binding
-descriptions (`GetVertexInputs`), the V# of every stream, the stream memory merged into
-ranges with each stream's range index, and the XXH3 of the streams (object motion). The GPU
-thread only obtains the buffers of the merged ranges and records the bindings. Used when the
-prepared draw's pipeline was taken, the attribute count matches the pipeline's fetch shader
-and no frame capture runs; toggle 4096 switches it off together with the sharps.
+`PreparedDraw::vertex` 为动态顶点输入路径保存：属性与绑定描述
+（`GetVertexInputs`）、每个流的 V#、合并为各流 range index 范围的流内存，
+以及各流的 XXH3（物体运动）。GPU 线程只获取合并范围的缓冲并记录绑定。
+当预备 draw 的管线被采用、属性数与管线的 fetch shader 匹配、且未运行帧捕获时
+使用；toggle 4096 与 sharp 一同关闭它。
 
-A/B (standing still, `BB_FPS_LIMIT=0`, FSR 4, 16 threads): ~69.3 FPS on, ~65.7 off (+5.5%;
-the sharps alone gave +3%). Screenshots identical.
+A/B（静止，`BB_FPS_LIMIT=0`，FSR 4，16 线程）：启用约 69.3 FPS，禁用约 65.7 FPS
+（+5.5%；仅 sharp 已贡献 +3%）。截图一致。
 
-Render targets were looked at and left on the GPU thread: their descriptions are already
-memoized per slot (key copy + compare), the size hint (`last_cb_extent`) is GPU-thread state
-rather than register state, and the rest of `BeginRendering` is view lookup, barriers and the
-reduced-resolution proxies — all on shared mutable state.
+渲染目标经考察后留在 GPU 线程：它们的描述已按 slot 做了memo（键拷贝 + 比较），
+尺寸提示（`last_cb_extent`）是 GPU 线程状态而非寄存器状态，而 `BeginRendering`
+的其余部分都是视图查找、barrier 与降分辨率代理 —— 全在共享可变状态上。
 
-## Engine short paths: investigation (2026-09-30, in progress)
+## 引擎短路径：调查（2026-09-30，进行中）
 
-- The eboot has no symbols but links Sony's Gnmx (`sdk\target\src\gnmx\gfxcontext.cpp`,
-  `lwgfxcontext.cpp`); FromSoftware's Dantelion2 CoreGraphics2 sits on top; YEBIS does the
-  post-processing.
-- `BB_BUFFER_STATS=1` (buffer_cache.cpp) prints buffer bindings per guest region every 5 s.
-  Almost all traffic comes from the engine's frame ring, ~0x1043400000–0x1049xxxxxx inside the
-  2.4 GB direct allocation at 0x1042c00000: ~400k small constant copies/s (~190 MB/s) and
-  ~850 MB/s of arena re-uploads after CPU writes (~13 MB per frame).
-- Candidate short path: import that ring into Vulkan (VK_EXT_external_memory_host) so the GPU
-  reads it in place — no copies, no page tracking, far fewer GPU-thread operations.
-  Blocker to resolve first: EOP fences are signalled when the GPU thread records the packet,
-  not when the GPU executes it, so the guest may rewrite ring data still unread by the GPU.
-  With ~100 MB of ring and ~13 MB per frame the wrap is ~7–8 frames; the GPU's lag is bounded
-  by the presenter's frame pool (`present_frames`, swapchain image count). Next: measure the
-  ring's wrap period per frame and the real GPU lag, then prototype the import behind a toggle.
+- eboot 无符号，但链接了 Sony 的 Gnmx（`sdk\target\src\gnmx\gfxcontext.cpp`、
+  `lwgfxcontext.cpp`）；FromSoftware 的 Dantelion2 CoreGraphics2 架在其上；
+  YEBIS 负责后处理。
+- `BB_BUFFER_STATS=1`（buffer_cache.cpp）每 5 s 按客户区域打印缓冲绑定。
+  几乎全部流量来自引擎的帧环形缓冲，位于 0x1042c00000 处 2.4 GB 直接分配内部的
+  约 0x1043400000–0x1049xxxxxx：约 400k 次小常量拷贝/s（约 190 MB/s），
+  以及 CPU 写入后约 850 MB/s 的 arena 重传（每帧约 13 MB）。
+- 候选短路径：把该环形缓冲作为 Vulkan 外部内存导入（`VK_EXT_external_memory_host`），
+  让 GPU 就地读取 —— 无拷贝、无页跟踪、GPU 线程操作大幅减少。
+  需先解决的阻塞点：EOP fence 是在 GPU 线程录制包时置位的，而非 GPU 执行时，
+  因此客户可能改写GPU 尚未读取的环形数据。环形约 100 MB、每帧约 13 MB，
+  回绕约 7–8 帧；GPU 滞后由presenter 的帧池（`present_frames`、交换链图像数）
+  限定。下一步：测量环形的每帧回绕周期与真实 GPU 滞后，然后在 toggle 后做原型。
+- 
+### 帧数据窗口的测量（`BB_BUFFER_STATS=1`）
 
-### Measurements for the frame-data window (BB_BUFFER_STATS=1)
+- 0x104xxxxxxx 中 64 KiB 块的重用距离：绝大多数为 1 帧（偶尔 2 帧）。引擎每帧
+  重写同一段内存；不存在长环形。
+- GPU 线程开始一帧时的 GPU 滞后（`GPU lag at frame start`）：几乎总是 0 ——
+  GPU 已完成上一帧。但引擎在 GPU 仍在执行当前帧时写入下一帧的数据，而 EOP fence
+  是在录制时置位的。**因此就地读取这段内存（`VK_EXT_external_memory_host`）是不安全的**，
+  除非 fence 等待真实的 GPU 完成，而这会让客户付出代价（它要等这些 fence）。已放弃。
+- 热窗口内每秒：约 370k 次小常量拷贝（约 179 MB，每个约 480 B）与约 3.6k 次
+  arena 绑定，覆盖约 13.8 GB（每次绑定约 3.8 MB），其中仅约 516 MB 被重传。
+  拷贝绑定范围而非跟踪页会把流量放大约 27 倍（这正是「热页」尝试掉到 33 FPS 的原因）；
+  在那里页跟踪才是正确机制。
+- 剩余候选：常量区按次提交做快照（用更少更大的拷贝替代每帧约 6000 次），
+  以及把顶点缓冲绑定裁到某个 draw 实际使用的索引范围（V# 覆盖整个顶点池，
+  所以每次绑定要遍历约 950 个被跟踪的页）。
 
-- Reuse distance of 64 KiB blocks in 0x104xxxxxxx: overwhelmingly 1 frame (then 2). The engine
-  rewrites the same memory every frame; there is no long ring.
-- GPU lag when the GPU thread starts a frame (`GPU lag at frame start`): almost always 0 —
-  the GPU has finished the previous frame. But the engine writes the next frame's data while
-  the GPU still executes the current one, and EOP fences are signalled at record time.
-  **Reading this memory in place (VK_EXT_external_memory_host) is therefore unsafe** unless
-  fences wait for real GPU completion, which costs the guest (it waits on them). Dropped.
-- Per second in the hot window: ~370k small constant copies (~179 MB, ~480 B each) and ~3.6k
-  arena bindings covering ~13.8 GB (≈3.8 MB per binding) of which only ~516 MB are re-uploaded.
-  Copying bound ranges instead of tracking pages would multiply the traffic by ~27 (why the
-  "hot pages" attempt fell to 33 FPS); page tracking is the right mechanism there.
-- Remaining candidates: per-submission snapshots of the constant area (fewer, larger copies
-  instead of ~6000 per frame) and trimming vertex-buffer bindings to the index range a draw
-  uses (the V#s cover whole vertex pools, so each binding walks ~950 tracked pages).
+### 试过又回退：按 epoch 的常量块
 
-### Tried and reverted: per-epoch constant chunks
+小型只读常量由每块、每队列任务 epoch 一份快照提供（epoch 在每次任务进入与恢复时
+都变，因此一个块只能服务其拷贝之前写入的数据）。一次运行内 A/B，静止：
+32 KiB 块为 82/82/79 FPS，禁用为 85/84/84（更慢：多拷贝的字节数代价超过省下的操作）；
+8 KiB 块为 85/85/85 对 85/83/85（无差异）。逐绑定的常量拷贝不是限制帧率的因素；
+该改动已移除。`BB_BUFFER_STATS=1`（每区域绑定数、重用距离、GPU 滞后）保留。
 
-Small read-only constants served from one snapshot per chunk and queue-task epoch (the epoch
-changed at every task entry and resume, so a chunk only served data written before its copy).
-A/B in one run, standing still: 32 KiB chunks 82/82/79 FPS vs 85/84/84 without (slower: the
-extra copied bytes cost more than the saved operations); 8 KiB chunks 85/85/85 vs 85/83/85
-(no difference). The per-binding constant copies are not what limits the frame; the change
-was removed. `BB_BUFFER_STATS=1` (bindings per region, reuse distance, GPU lag) stays.
+做完这部分后的状态，静止，`BB_FPS_LIMIT=0`，FSR 4：82–85 FPS；GPU 命令线程约占
+一个核的 90%，录制线程约 92%（主要是自旋），GPU 约 70% 忙碌。
 
-State after this work, standing still, `BB_FPS_LIMIT=0`, FSR 4: 82–85 FPS; GPU command thread
-~90% of a core, recording thread ~92% (mostly its spin), GPU ~70% busy.
+### 纹理绑定：重复集合与 UpdateImage 快路径
 
-### Texture binding: repeated sets and the UpdateImage fast path
+- 测过并放弃：只有约 13% 的 draw 在所有 stage 上都精确绑定与上一次 draw 相同的
+  纹理与采样器（跑过亚哈兰），因此跳过整组纹理最多省 GPU 线程约 3%。
+- `TextureCache::UpdateImage` 对每次纹理绑定都会运行；对于本 GC 周期内已被跟踪
+  且已触碰过的干净已注册图像，它只取纹理缓存互斥锁（与客户线程的缺页处理共享）。
+  现在该情况下无锁返回，以原子方式读标志位（toggle 1073741824 = 1 << 30 恢复
+  加锁路径）。A/B，8 个阶段各 20 s：均值 81.8 对 80.2 FPS（+2%），4 对中 3 对领先；
+  运行期间游戏窗口被其他应用部分遮挡，故仅作参考。
+- A/B 脚本现在会在每次阶段切换时记录日志行，并打印每阶段均值。
 
-- Measured and dropped: only ~13% of draws bind exactly the textures and samplers of the
-  previous draw in every stage (running through Yharnam), so skipping whole texture sets
-  would save at most ~3% of the GPU thread.
-- `TextureCache::UpdateImage` runs for every texture binding; for a clean, registered image
-  already tracked and touched in this GC period it only took the texture-cache mutex (shared
-  with the guest threads' fault handlers). It now returns without the lock in that case,
-  reading the flags atomically (toggle 1073741824 = 1 << 30 restores the locked path).
-  A/B, 8 phases of 20 s: 81.8 vs 80.2 FPS mean (+2%), 3 of 4 pairs ahead; the game window
-  was partly covered by other applications during the run, so treat it as indicative.
-- The A/B script now records the log line at each phase switch and prints per-phase means.
+## LTO 与 PGO（2026-09-30）
 
-## LTO and PGO (2026-09-30)
+`build.sh` 构建 `libbbgpu` 时启用 LTO（`-flto=auto`，对链接进去的 sirit 与
+FSR-Vulkan 同样生效），并在 `pgo/` 下有profile 时启用 `-fprofile-use`
+（`-fprofile-partial-training -fprofile-correction`；用于未加这两个选项编译后
+又改过的函数）。不用 `-march`：同一份构建要能在 Steam Deck 上跑。
 
-`build.sh` builds `libbbgpu` with LTO (`-flto=auto`, also for sirit and FSR-Vulkan linked
-into it) and, when `pgo/` holds a profile, with `-fprofile-use` (`-fprofile-partial-training
--fprofile-correction`; functions changed since the profile compile without it). No `-march`:
-the same build runs on the Steam Deck.
+采集 profile：`BB_PGO=generate bash run.sh` 构建带仪表的库
+（`-fprofile-generate -fprofile-update=atomic`），每 30 s 写一次 `pgo/`
+（`bb:pgo` 线程：`__gcov_dump` + `__gcov_reset`，因为游戏常经`_exit` 结束）；
+正常玩几分钟。下一次普通构建就会用它。`BB_PGO=off` / `BB_LTO=OFF` 可禁用。
+代码有较大改动后重新生成 profile。
 
-Collecting a profile: `BB_PGO=generate bash run.sh` builds an instrumented library
-(`-fprofile-generate -fprofile-update=atomic`) that writes `pgo/` every 30 s (`bb:pgo` thread:
-`__gcov_dump` + `__gcov_reset`, since the game often ends through `_exit`); play a few minutes
-of ordinary gameplay. The next plain build uses it. `BB_PGO=off` / `BB_LTO=OFF` disable them.
-Regenerate the profile after larger code changes.
+对比，游戏内三次运行（取游戏内 5 s 窗口的中位数，>800 draw/帧），用新增的
+`Frame stats` 字段「GPU thread us/draw」（GPU 命令线程每 draw 的 CPU 时间，
+比 FPS 更能容忍小的场景差异）：
 
-Comparison, three runs in game (median of in-game 5 s windows, >800 draws/frame), with the new
-`Frame stats` field "GPU thread us/draw" (CPU time of the GPU command thread per draw, which
-tolerates small scene differences better than FPS):
-
-| build | FPS | GPU thread µs/draw |
+| 构建 | FPS | GPU 线程 µs/draw |
 |---|---|---|
-| no LTO, no PGO | 73.2 | 7.72 |
-| LTO | 74.4 | 7.58 (−1.8%) |
-| LTO + PGO | 76.3 | 7.35 (−4.8%) |
+| 无 LTO，无 PGO | 73.2 | 7.72 |
+| LTO | 74.4 | 7.58（−1.8%） |
+| LTO + PGO | 76.3 | 7.35（−4.8%） |
 
-## Second pass: where the GPU thread's time goes, and a texture helper (2026-09-30)
+## 第二轮：GPU 线程的时间去向，以及一个纹理辅助线程（2026-09-30）
 
-Standing in Hunter's Nightmare, FSR 4, `BB_FPS_LIMIT=0`, ~85 FPS, ~1610 draws/frame.
+站在猎人噩梦，FSR 4，`BB_FPS_LIMIT=0`，约 85 FPS，每帧约 1610 draw。
 
-**On-CPU profile** (perf, direct children): `Draw` 74% — `BindResources` 32% (textures 16%,
-buffers 13%), `BeginRendering` 8%, `GetGraphicsPipeline` 5%, `BindVertexBuffers` 4.5%,
-`ResetBindings` 4%, dynamic state 2%; `DispatchDirect` 6%; PM4 decode and register hashing ~9%.
-No function above ~5% self time: the cost is cache misses spread over the texture, buffer and
-barrier structures (`slot_images[id]`, image descriptions, backing state, set writes).
+**CPU侧剖析**（perf，直接子节点）：`Draw` 74% —— `BindResources` 32%
+（纹理 16%、缓冲 13%），`BeginRendering` 8%，`GetGraphicsPipeline` 5%，
+`BindVertexBuffers` 4.5%，`ResetBindings` 4%，动态状态 2%；`DispatchDirect` 6%；
+PM4 解码与寄存器哈希约 9%。没有 Self time 超过约 5% 的函数：代价是分散在纹理、
+缓冲与 barrier 结构上的 cache miss（`slot_images[id]`、图像描述、backing 状态、集合写入）。
 
-**Wall time** (new `Frame stats` fields): the GPU thread is on the CPU 91% of the time and
-waits for guest submissions 0.5%. About 9% is blocked in `Scheduler::WaitHostCopies`: ~130
-times per frame (EOP/EOS events, `WriteData`, submissions) it waits for the small guest
-copies queued in the recording stream, i.e. until the recording thread has recorded every
-command before them, plus ~4% for the copy threads (`BbCopy::WaitAsync`). The recording thread
-itself works ~40% (the rest is its spin); it is not the limit.
+**墙钟时间**（新增 `Frame stats` 字段）：GPU 线程 91% 的时间在 CPU 上，
+等待客户提交 0.5%。约 9% 阻塞在 `Scheduler::WaitHostCopies`：每帧约 130 次
+（EOP/EOS事件、`WriteData`、提交）等待录制流中排队的小客户拷贝，也就是等到录制
+线程把它们之前的每条命令都录完，另有约 4% 花在拷贝线程（`BbCopy::WaitAsync`）。
+录制线程自身约 40% 忙碌（其余是自旋）；它不是瓶颈。
 
-### Texture binding on a helper thread (opt-in: `BB_TEXTURE_HELPER=1`, toggle 1 << 22)
+### 辅助线程上的纹理绑定（可选项：`BB_TEXTURE_HELPER=1`，toggle 1 << 22）
 
-`bb:TexBind` binds a draw's textures while the GPU thread binds its buffers and resolves its
-vertex/index buffers (split into Resolve/Emit, toggle 1 << 23); the GPU thread joins before
-`BeginRendering`. The helper takes only the memoized path (FindImage memo valid, image clean,
-no scene-target proxy, no upscaler redirect, no storage images, no mip arrays, no storage
-buffers in the pipeline); anything else is bound after the join. The GPU thread joins before
-it changes image state (`Runtime::BeforeImageAccess` in `Transit`, `FlushBarriers`,
-`SetBackingSamples`, and in `SynchronizeMemoryFromImage` once a texel buffer aliases an image).
-68% of draws were bound in parallel, the image was unchanged — and the frame rate too:
-85.9 FPS with the helper vs 85.8 without (A/B, 6 × 16 s).
+`bb:TexBind` 在 GPU 线程绑定其缓冲并解析顶点/索引缓冲时，绑定该 draw 的纹理
+（拆为 Resolve/Emit，toggle 1 << 23）；GPU 线程在 `BeginRendering` 之前汇合。
+辅助线程只走 memo 化路径（FindImage memo 有效、图像干净、无场景目标代理、
+无超分重定向、无 storage image、无 mip 数组、管线中无 storage buffer）；
+其余都在汇合之后绑定。GPU 线程在改动图像状态之前汇合（`Transit` 中的
+`Runtime::BeforeImageAccess`、`FlushBarriers`、`SetBackingSamples`，
+以及 `SynchronizeMemoryFromImage` 中纹素缓冲与图像 alias 的情形）。
+68% 的 draw 并行绑定完成，图像未变—— 帧率也一样：启用辅助线程 85.9 FPS，
+禁用 85.8 FPS（A/B，6 × 16 s）。
 
-Instrumented with `rdtsc`: the helper's task took ~6200 cycles per fork where the same work
-cost ~4600 on the GPU thread, and the GPU thread still waited ~2500 cycles per fork in the
-join. The descriptor infos, image states and binding flags the helper writes are read by the
-GPU thread right after, so each draw moves them between cores; the GPU thread's own work got
-slower by about what it handed over. Per-draw fork/join over ~7 µs of cache-bound work does
-not pay on this CPU; the helper stays opt-in for other CPUs.
+用 `rdtsc` 测量：辅助线程的任务每次 fork 约 6200 周期，而同样的工作 在GPU 线程上
+约 4600 周期，且 GPU 线程在汇合时每次 fork 仍要等约 2500 周期。辅助线程写的描述符
+info、图像状态与绑定标志紧接着就被 GPU 线程读取，因此每个 draw 都在核间搬运它们；
+GPU 线程自身的工作变慢的幅度约等于它交出去的部分。在这款 CPU 上，对约 7 µs 的
+cache 密集工作做逐 draw fork/join 不划算；该辅助线程在其他 CPU 上保留为可选项。
 
-### Other attempts
+### 其他尝试
 
-| change | A/B | kept |
+| 改动 | A/B | 保留 |
 |---|---|---|
-| FindView memo in the image description cache (1 << 21) + write prefetch in record chunks (1 << 20) | 81.5 vs 80.8 FPS | yes |
-| format check by table instead of `magic_enum::enum_contains` (a linear scan per texture per draw); hot `Image` fields (flags, binding, tracking range, backing, ticks) moved in front of `ImageInfo` | within noise | yes (no downside) |
-| host copy queue: small copies in a lock-free MPMC queue, run by the idle recording thread, the rest by the GPU thread at the wait | blocked 9.5% → 4.8%, but 86.5 vs 87.2 FPS: the copying moved onto the GPU thread | no |
-| no barrier tracking for read-only stream buffer ranges | 85.9 vs 87.4 FPS, both phase orders (cause not found) | no |
-| small host copies batched, one recorded command per 32 | 86.4 vs 86.2 FPS | no |
+| 图像描述缓存中的 FindView memo（1 << 21）+ 记录块中的写预取（1 << 20） | 81.5 对 80.8 FPS | 是 |
+| 用查表替代 `magic_enum::enum_contains` 的格式检查（后者每 draw 每纹理一次线性扫描）；把热的 `Image` 字段（标志、绑定、跟踪范围、backing、ticks）移到 `ImageInfo` 之前 | 在噪声范围内 | 是（无副作用） |
+| host 拷贝队列：小拷贝进无锁 MPMC 队列，由空闲的录制线程运行，其余在等待时由 GPU 线程处理 | 阻塞 9.5% → 4.8%，但 86.5 对 87.2 FPS：拷贝转移到了 GPU 线程上 | 否 |
+| 只读流缓冲范围不做 barrier 跟踪 | 85.9 对 87.4 FPS，两种阶段顺序皆然（未找到原因） | 否 |
+| 小 host 拷贝批量合并，每 32 个记录一条命令 | 86.4 对 86.2 FPS | 否 |
 
-Fixed on the way: a draw-preparation worker could stop the process with
-`SurfaceFormat: Unknown data_format=15` — it read a V# the guest was still writing and
-`SurfaceFormat` asserts. Workers now use `TrySurfaceFormat` and leave such draws to the GPU
-thread. It showed up with the slower PGO-instrumented build.
+顺带修掉的问题：一个 draw 准备工作线程可能让进程停在
+`SurfaceFormat: Unknown data_format=15` —— 它读了一个客户仍在写的 V#，
+而 `SurfaceFormat` 会断言。worker 现在改用 `TrySurfaceFormat`，把这类 draw 留给
+GPU 线程。它在更慢的 PGO 插桩构建下暴露出来。
 
-PGO profile regenerated for the changed code (camera rotation only, merged with the old one).
-Before/after, as a user builds them (37c8eac with its profile vs this state with the new one),
-three alternating restarts × 50 s: 86.9 vs 86.4 FPS, 6.47 vs 6.51 µs/draw — no change beyond
-the run-to-run spread (±1.5 FPS).
+为改动的代码重新生成了 PGO profile（仅相机旋转，与旧profile 合并）。
+前后对比（按用户构建方式：37c8eac 及其 profile 对当前状态的新 profile），
+三次交替重启 × 50 s：86.9 对 86.4 FPS，6.47 对 6.51 µs/draw ——
+变化不超过运行间散布（±1.5 FPS）。
 
-### What would scale
+### 什么才能扩展
 
-Moving work to another core per draw costs about what it saves, because the data is shared.
-Scaling needs splits where each thread owns its data for long stretches:
+把工作按 draw 移到另一个核，代价约等于它节省的量，因为数据是共享的。
+要扩展需要这样的拆分：每个线程长时间拥有自己的数据：
 
-1. **Two-stage pipeline.** A second thread owns the texture cache and image state
-   (`PrepareRenderState`, `BindTextures`, `BeginRendering`, barriers, descriptor writes, dynamic
-   state, draw recording) and runs a draw behind the GPU thread, which keeps decode, pipelines
-   and the buffer cache. The second thread cannot read `liverpool->regs` (the GPU thread is
-   already on later packets): it keeps its own register copy from the per-buffer deltas the
-   draw scanner already records (`AmdGpu::RegDelta`). Packets that touch memory or images
-   outside draws (DMA, `WriteData`, EOP/EOS, dispatches, fast clears) drain the pipeline.
-   Estimate: the second stage takes ~30% of today's GPU thread work, less the drains. Large,
-   delicate refactor.
-2. **Less work per draw.** A frame-to-frame memo of a stage's resolved textures (image ids,
-   views, samplers) keyed by the prepared T#/S# hashes and validated by the registry
-   generation, image cleanliness and layouts, instead of per-texture lookups.
-3. **The copies before fences** (~9% blocked): keep them off the GPU thread's critical path,
-   e.g. by letting the idle draw-preparation workers drain a copy queue.
+1. **两段式管线。** 第二个线程拥有纹理缓存与图像状态
+   （`PrepareRenderState`、`BindTextures`、`BeginRendering`、barrier、描述符写入、
+   动态状态、draw 录制），在 GPU 线程之后跑 draw；后者保留解码、管线与缓冲缓存。
+   第二个线程不能读 `liverpool->regs`（GPU 线程已在处理更后面的包）：它从 draw
+   扫描器已记录的每缓冲增量（`AmdGpu::RegDelta`）维护自己的寄存器副本。
+   在 draw 之外触及内存或图像的包（DMA、`WriteData`、EOP/EOS、dispatch、快速清）
+   会排空管线。估计：第二段承担今天 GPU 线程约 30% 的工作，减去排空部分。
+   是一次大规模、精细的重构。
+2. **每 draw 更少的工作。** 按预备的 T#/S# 哈希为 stage 已解析的纹理
+   （image id、view、采样器）做帧到帧 memo，并用注册表代数、图像洁净度与布局验证，
+   取代逐纹理查找。
+3. **fence 之前的拷贝**（约 9% 阻塞）：让它们离开 GPU 线程的关键路径，
+   例如由空闲的 draw 准备工作线程排空一个拷贝队列。
 
-## Two-stage draw pipeline (2026-09-30)
+## 两段式 draw 管线（2026-09-30）
 
-`vk_draw_pipe.h`. The GPU command thread (stage A) keeps PM4 decoding, the register file, the
-constant engine and pipeline selection. A direct draw or dispatch becomes a packet in a 16 MiB
-ring: the 32-word register blocks written since the previous packet (`Liverpool::pipe_dirty`,
-marked by `ApplyGraphicsRegisterPacket`), the CB/DB size hints, each stage's user data, flattened
-user data and program base, and the draw parameters (for a dispatch the `ComputeProgram`).
-The draw recording thread `bb:DrawRec` (stage B) applies the blocks to its own register copy and
-runs the rest of the draw (`DrawRecord`, `DispatchRecord`): textures, buffers, render targets,
-barriers, descriptors, dynamic state, recording. While packets are in flight stage B owns the
-texture/buffer caches, the runtime, the scheduler, the scene targets, the upscaler and the motion
-state.
+`vk_draw_pipe.h`。GPU 命令线程（stage A）保留 PM4 解码、寄存器文件、常量引擎
+与管线选择。一个直接 draw 或 dispatch 变成 16 MiB 环形缓冲中的一个包：
+自上一个包以来写入的 32 字寄存器块（`Liverpool::pipe_dirty`，由
+`ApplyGraphicsRegisterPacket` 标记）、CB/DB 尺寸提示、每个 stage 的用户数据、
+扁平化用户数据与程序基址，以及 draw 参数（dispatch 则是 `ComputeProgram`）。
+draw 录制线程 `bb:DrawRec`（stage B）把这些块应用到自己的寄存器副本，并执行 draw
+的其余部分（`DrawRecord`、`DispatchRecord`）：纹理、缓冲、渲染目标、barrier、
+描述符、动态状态、录制。当包在飞行中时，stage B 拥有纹理/缓冲缓存、运行时、
+调度器、场景目标、超分器与运动状态。
 
-- Stage B reads registers through `Rasterizer::Regs()/CbExtent()/CsRegs()` (its copy there,
-  Liverpool's elsewhere) and shader user data through `Shader::Info::UserData()/FlatUserData()/
-  ProgramBase()`, which return the snapshot stage B installed for the stages of the current
-  draw (`Info::ud_snapshots`, thread-local).
-- Everything else stage A does on stage B's state first waits for it to run dry
-  (`Rasterizer::DrainDrawPipe`): every public rasterizer entry point on the GPU thread, PM4
-  packets other than register writes/draws/dispatches/fences (`PipelinedOpcode`), pending
-  commands (`ProcessCommands`), compute queue packets, `DumpConstRam`.
-- End-of-pipe/-shader events run in order on stage B (`Rasterizer::RunInOrder`). A
-  `WaitRegMem` on a fence value handed to stage B counts as met (`Liverpool::pending_fences`):
-  stage B runs everything in stream order anyway. Unmet waits drain stage B, then yield.
-- The EOP fence is signalled by the Vulkan recording thread after the guest memory copies queued
-  before it (`Scheduler::SignalAfterHostCopies`), so stage B does not wait for them.
-- A submission's prepared draws stay alive until stage B has passed them
-  (`RetireSubmission`) instead of a drain at its end.
-- Faults: stage B handles its own inline, like the GPU thread (`IsGpuSideThread`); the GPU
-  thread drains stage B before handling one inline. With userfaultfd, faults of the GPU thread
-  take the locked path of guest threads.
-- `DmaData` to 0x3022C (skipped by the handler; ~70k/s) does not drain.
-- `BB_PIPE_VERIFY=N`: every Nth packet also carries the full register file and stage B reports
-  words where its copy differs (none seen in game, menus included).
-- `BB_DRAW_PIPE=0/1` overrides the default (on with 8+ hardware threads). The toggle mask is 64
-  bits now (bits 20-29 are raw debug toggles of the motion vectors and the upscaler, which the
-  first measurements below also flipped): 1 << 37 whole pipeline, 1 << 38 fences on stage B,
-  1 << 39 WaitRegMem on pending fences, 1 << 40 dispatches, 1 << 41 fences signalled by the
-  recording thread, 1 << 42 WriteData/DmaData/special draws/flip IRQ on stage B, 1 << 36 constant
-  ring. `Frame stats` add a `Draw pipe` line: draws, drains that waited and why, stage A waiting,
-  stage B busy.
+- stage B 通过 `Rasterizer::Regs()/CbExtent()/CsRegs()` 读寄存器（在它那里是自己的副本，
+  其他地方是 Liverpool 的），通过 `Shader::Info::UserData()/FlatUserData()/ProgramBase()`
+  读 shader 用户数据，后者返回 stage B 为当前 draw 的各 stage 安装的快照
+  （`Info::ud_snapshots`，线程局部）。
+- stage A 在 stage B 状态上做的其他一切，先要等它排空
+  （`Rasterizer::DrainDrawPipe`）：GPU 线程上每个公开的 rasterizer 入口、除寄存器
+  写入/draw/dispatch/fence 之外的 PM4 包（`PipelinedOpcode`）、待处理命令
+  （`ProcessCommands`）、compute 队列包、`DumpConstRam`。
+- 管末/着色器事件在 stage B 上按序执行（`Rasterizer::RunInOrder`）。交给 stage B
+  的某个 fence 值上的 `WaitRegMem` 视为已满足（`Liverpool::pending_fences`）：
+  stage B 本来就按流顺序执行一切。未满足的等待先排空 stage B，然后让出。
+- EOP fence 由 Vulkan 录制线程在其之前排队的客户内存拷贝完成后置位
+  （`Scheduler::SignalAfterHostCopies`），因此 stage B 不必等它们。
+- 一次提交的预备 draw 保持存活直到 stage B 已越过它们
+  （`RetireSubmission`），而不是在其结束时排空。
+- 缺页：stage B 像 GPU 线程一样内联处理自己的（`IsGpuSideThread`）；
+  GPU 线程在处理某个内联缺页前先排空 stage B。使用 userfaultfd 时，
+  GPU 线程的缺页走客户线程的加锁路径。
+- 到 0x3022C 的 `DmaData`（被处理程序跳过；约 70k/s）不触发排空。
+- `BB_PIPE_VERIFY=N`：每第 N 个包还携带完整寄存器文件，stage B 报告其副本有差异的字
+  （游戏内未见，菜单亦然）。
+- `BB_DRAW_PIPE=0/1` 覆盖默认值（硬件线程 ≥ 8 时开启）。toggle掩码现在是 64 位
+  （第 20–29 位是运动矢量与超分器的裸调试 toggle，下面最初的测量也翻转过它们）：
+  1 << 37 整条管线、1 << 38 fence 在 stage B 上、1 << 39 pending fence 上的
+  WaitRegMem、1 << 40 dispatch、1 << 41 由录制线程置位的 fence、
+  1 << 42 WriteData/DmaData/特殊 draw/翻转 IRQ 在 stage B 上、1 << 36 常量环。
+  `Frame stats` 新增 `Draw pipe` 行：draw 数、等待的排空及原因、stage A 等待时间、
+  stage B 忙碌时间。
 
-Results (Hunter's Nightmare, standing, FSR 4, `BB_FPS_LIMIT=0`, A/B in one run):
+结果（猎人噩梦，静止，FSR 4，`BB_FPS_LIMIT=0`，一次运行内 A/B）：
 
-| | pipeline on | off |
+| | 管线开 | 关 |
 |---|---|---|
-| 16 threads | 96.1 FPS | 80.6 FPS (+19%) |
-| 4 cores / 8 threads (`taskset -c 0-3,8-11`) | 83.8 FPS | 71.0 FPS (+18%) |
+| 16 线程 | 96.1 FPS | 80.6 FPS（+19%） |
+| 4 核 / 8 线程（`taskset -c 0-3,8-11`） | 83.8 FPS | 71.0 FPS（+18%） |
 
-Steps on the way (FPS in the same scene): first version, drains at every non-draw packet —
-79.8 (drained ~80k/s, almost all no-op `DmaData`); skipping those — 89; fences on stage B and
-lazy `WaitRegMem` — 92; dispatches handed over — 93; fences signalled by the recording thread —
-103.5 (A/B of that step alone: 103.5 vs 94.9).
+过程中的步骤（同一场景 FPS）：第一版在每个非 draw 包处排空 —— 79.8
+（排空约 80k/s，几乎全是空操作的 `DmaData`）；跳过这些 —— 89；fence 放到 stage B
+并惰性 `WaitRegMem` —— 92；dispatch 移交 —— 93；fence 由录制线程置位 —— 103.5
+（单独 A/B 该步：103.5 对 94.9）。
 
-Now stage B is the limit (~85-90% busy, the draw path as profiled above), stage A waits most of
-the time, and the GPU is ~80% busy with FSR 4. Remaining drains: `WriteData` (~30/frame: 192
-zero bytes to a frame buffer and a 4-byte label, whose readers are unknown), non-trivial
-`DmaData`, indirect draws. Next: move work from stage B to stage A — the buffer side of a draw
-(ObtainBuffer, uploads) needs stage A to own the buffer cache and hand its commands to stage B.
+现在 stage B 是瓶颈（约 85–90% 忙碌，profile 见上），stage A 大部分时间在等待，
+GPU 在 FSR 4 下约 80% 忙碌。剩余排空：`WriteData`（每帧约 30 个：向帧缓冲写 192 个
+零字节加一个 4 字节标签，其读取方不明）、非平凡 `DmaData`、间接 draw。
+下一步：把工作从 stage B 移到 stage A —— draw 的缓冲侧（ObtainBuffer、上传）
+需要 stage A 拥有缓冲缓存并把命令交给 stage B。
 
-### Second round (2026-09-30)
+### 第二轮（2026-09-30）
 
-- `WriteData`, `DmaData`, the flip IRQ after them (the buffer label is a `WriteData`) and draws
-  `FilterDraw` handles itself (fast clear elimination, resolve, depth copy) run in order on
-  stage B. Drains: ~7 per frame (DumpConstRam, indirect draws/dispatches).
-- **Constant ring** (`vk_constant_ring.h`): stage A copies small read-only guest buffers (the
-  stream path of `ObtainBuffer`, and the flattened user data) into a 32 MiB ring of its own;
-  stage B only binds them. A region is reused once the submission stage B recorded its last
-  draw in has completed (stage B stamps packets with the submission tick). Buffers overlapping
-  guest memory that queued work will write (storage buffers, DMA, WriteData, fences:
-  `NotePendingGpuWrite`) or GPU-modified memory stay with stage B.
-- `BB_PIPE_VERIFY` also re-walks each stage's resource tables on stage B and compares them with
-  stage A's snapshot (guarded against faults: pointers may be stale by then). Pixel shaders whose
-  `Info` the pipeline selection does not refresh (no user data) are skipped.
+- `WriteData`、`DmaData`、其后的翻转 IRQ（缓冲标签就是一个 `WriteData`）以及 draw
+  `FilterDraw` 自行处理的那些（快速清消除、resolve、深度拷贝）在 stage B 上按序执行。
+  排空：每帧约 7 次（DumpConstRam、间接 draw/dispatch）。
+- **常量环**（`vk_constant_ring.h`）：stage A 把小型只读客户缓冲（`ObtainBuffer` 的
+  流路径，以及扁平化用户数据）拷进自己的 32 MiB 环；stage B 只绑定它们。
+  一个区域在 stage B 已录制其最后一个 draw 的那次提交完成后即可复用
+  （stage B 用提交 tick 给包打戳）。与「已排队工作将写入的客户内存」重叠的缓冲
+  （storage buffer、DMA、WriteData、fence：`NotePendingGpuWrite`）或被 GPU 修改过的
+  内存仍留给 stage B。
+- `BB_PIPE_VERIFY` 还会在 stage B 上重走每个 stage 的资源表，并与 stage A 的快照
+  比对（对缺页做了防护：指针到那时可能已失效）。管线选择不会刷新其 `Info` 的
+  像素着色器（无用户数据）被跳过。
 
-A/B in one run (16 threads, FSR 4 Ultra Performance, clean toggle bits): whole pipeline
-110.9 vs 83.9 FPS (+32%); constant ring 114.2 vs 102.5 FPS (+11%).
+一次运行内 A/B（16 线程，FSR 4 Ultra Performance，toggle 位清零）：
+整条管线 110.9 对 83.9 FPS（+32%）；常量环 114.2 对 102.5 FPS（+11%）。
 
-### GPU time per frame vs upscaler preset
+### 每帧 GPU 时间与超分预设
 
-The GPU (RX 7800 XT) now limits more than the CPU. Presets change it little:
+GPU（RX 7800 XT）现在比 CPU 更限制帧率。预设对此影响很小：
 
-| mode | FPS | GPU busy | GPU ms/frame |
+| 模式 | FPS | GPU 忙碌 | GPU ms/帧 |
 |---|---|---|---|
-| upscaler off | 132 | 76% | 5.8 |
+| 关闭超分 | 132 | 76% | 5.8 |
 | FSR 3 Native AA | 116 | 76% | 6.6 |
-| FSR 3 Ultra Performance (scene 640x360) | 114 | 71% | 6.3 |
+| FSR 3 Ultra Performance（场景 640x360） | 114 | 71% | 6.3 |
 | FSR 4 Quality | 115 | 88% | 7.7 |
 | FSR 4 Ultra Performance | 114 | 84% | 7.4 |
 
-The reduced scene targets are used (1160 of ~1530 scene draws per frame), but rasterizing the
-scene costs little on this GPU: a ninth of the pixels saves ~0.3 ms. The rest does not depend on
-the preset (shadow maps, full-resolution post-processing and UI, FSR itself — FSR 4 costs
-~1.1-1.4 ms more than FSR 3 —, and emulation overhead: barriers, copies, resampling). FSR 4 at
-Native AA fails to start ("no free provider frame").
+降尺寸的场景目标确实被使用（每帧约 1530 个场景 draw 中的 1160 个），但在这款 GPU 上
+光栅化场景代价很低：像素数减到九分之一只省约 0.3 ms。其余部分不依赖预设
+（阴影贴图、全分辨率后处理与 UI、FSR 本身 —— FSR 4 比 FSR 3 多约 1.1–1.4 ms ——
+以及模拟开销：barrier、拷贝、重采样）。FSR 4 在 Native AA 下启动失败
+（"no free provider frame"）。
 
-### GPU profile (`BB_GPU_PROFILE=1`, `vk_gpu_profiler.h`)
+### GPU profile（`BB_GPU_PROFILE=1`，`vk_gpu_profiler.h`）
 
-Timestamps where each render pass, dispatch, upscaler run and submission end starts; the time to
-the next one is charged to it (barriers and copies in between included; "between submissions"
-is mostly the GPU waiting for the CPU). Printed every 5 s, GPU ms per frame by label. Timestamps
-are written outside render passes (`radv_CmdWriteTimestamp2` crashed inside some) and only into
-the rasterizer's scheduler (the presenter has its own).
+在每个渲染 pass、dispatch、超分器运行与提交结束处打时间戳；到下一个的时间记在其上
+（含中间的 barrier 与拷贝；「提交之间」那段大多是 GPU 在等 CPU）。每 5 s 打印，
+按标签给出每帧 GPU ms。时间戳写在渲染 pass 之外（`radv_CmdWriteTimestamp2`
+在部分 pass 内会崩），且只写入 rasterizer 的调度器（presenter 有自己的）。
 
-Hunter's Nightmare, FSR 4 Ultra Performance, ~110 FPS (8.8 ms/frame):
+猎人噩梦，FSR 4 Ultra Performance，约 110 FPS（8.8 ms/帧）：
 
-| label | ms/frame |
+| 标签 | ms/帧 |
 |---|---|
-| GPU idle between submissions | 2.1 |
-| guest copy shader `fefebf9f`, 57 dispatches (HLE) | 2.1 |
+| 提交之间的 GPU 空闲 | 2.1 |
+| 客户拷贝着色器 `fefebf9f`，57 次 dispatch（HLE） | 2.1 |
 | FSR 4 | 1.5 |
-| guest compute `3d5ebf4e`, 8 dispatches | 0.5 |
-| G-buffer passes at 640x360 | ~0.8 |
-| the rest (post-processing, UI, smaller passes) | ~1.8 |
+| 客户 compute `3d5ebf4e`，8 次 dispatch | 0.5 |
+| 640x360 的 G-buffer pass | 约 0.8 |
+| 其余（后处理、UI、更小的 pass） | 约 1.8 |
 
-This is why presets barely change the GPU load: only the scene passes scale.
+这就是预设几乎不改变 GPU 负载的原因：只有场景 pass 会随之缩放。
 
-The copy shader is HLE'd (`vk_shader_hle.cpp`) as `vkCmdCopyBuffer` with ~1024 small regions
-per dispatch. `buffer_multi_copy.comp` now does a batch in one dispatch (toggle 1 << 43):
-the copies themselves 0.4 ms/frame; with the buffer preparation before them the label fell from
-2.1 to 1.6 ms/frame. Most of the rest is `ObtainBuffer` over the merged ranges (copies of a few
-KiB spread over up to 57 MiB of destination): synchronizing only the copied parts saved another
-~0.75 ms of GPU time but cost more on the CPU (page protection per part, no stream path for
-small sources: 108.7 vs 114.3 FPS, sources only 105.7 vs 111.9), so it was dropped. Frame rate
-unchanged with the multi-copy shader (CPU-bound here); it helps where the GPU limits.
+拷贝着色器被 HLE（`vk_shader_hle.cpp`）为带约 1024 个小区域的 `vkCmdCopyBuffer`。
+`buffer_multi_copy.comp` 现在一次 dispatch 处理一批（toggle 1 << 43）：
+拷贝本身 0.4 ms/帧；加上前置的缓冲准备，该标签从 2.1 降到 1.6 ms/帧。
+其余大部分是 `ObtainBuffer` 遍历合并范围（几 KiB 的拷贝散布在最多 57 MiB 的目标上）：
+只同步被拷贝的部分又省了约 0.75 ms GPU 时间，但 CPU 代价更高（每部分做页保护、
+小源没有流路径：108.7 对 114.3 FPS，仅源时 105.7 对 111.9），故放弃。
+多拷贝着色器并未改变帧率（此处是 CPU 限制）；它在 GPU 限制时有用。
 
-### Render state memo (toggle 1 << 44)
+### 渲染状态 memo（toggle 1 << 44）
 
-~90% of draws continue the render pass the previous draw opened, yet `BeginRendering` redid
-the target lookups, transitions, scene-target proxies and upscaler redirects for each. Now a
-draw reuses the previous render state when the scheduler still has that exact pass open (nothing
-broke it: barriers, copies and dispatches end passes), the inputs match (target ids and views,
-pipeline attachment key, scene/raster scaling and upscaler redirect state, image registry
-generation, depth control), no clear is requested, and no target is also sampled by the draw.
-States with clears are not remembered (the next draw's differs). 90% hits; 122.1 vs 111.8 FPS
-(+9%); screenshots on/off differ no more than two taken in the same mode (animated scene).
+约 90% 的 draw 延续上一次 draw 打开的渲染 pass，但 `BeginRendering` 仍为每个 draw
+重做目标查找、transition、场景目标代理与超分重定向。现在一个 draw 在调度器仍持有
+那个确切 pass 时复用上一次的渲染状态（没有东西打破它：barrier、拷贝与 dispatch
+会结束 pass）、输入匹配（目标 id 与 view、管线 attachment 键、场景/光栅缩放与超分
+重定向状态、图像注册表代数、深度控制）、未请求 clear、且没有目标同时被该 draw 采样。
+带 clear 的状态不记忆（下一个 draw 的也不同）。命中率 90%；122.1 对 111.8 FPS（+9%）；
+开/关截图的差异不超过同模式下连拍两张的差异（有动画的场景）。
 
-### Texture set memo (toggle 1 << 45)
+### 纹理集合 memo（toggle 1 << 45）
 
-A stage's resolved textures (image after the depth redirect, view, backing, subresource range)
-remembered by the prepared T# hashes, 8192 slots, sets of up to 16 sampled images. A hit
-requires the same image registry generation, the same backings, no rebind, images up to date,
-no render-target feedback and no upscaler redirect; it then only redoes the per-draw effects
-(found tick, binding flags, bound list, layout transition, usage) and writes the descriptors.
-84% hits; 128.6 vs 121.8 FPS (+5.6%); screenshots on/off within the scene's own noise.
+一个 stage 已解析的纹理（深度重定向之后的 image、view、backing、子资源范围）
+按预备的 T# 哈希记忆，8192 个 slot，每组最多 16 个被采样 image。命中要求：
+相同的图像注册表代数、相同的 backing、无重绑定、image 已更新、无渲染目标反馈、
+无超分重定向；命中时只重做逐 draw 的效果（found tick、绑定标志、绑定列表、
+布局transition、用途）并写描述符。命中率 84%；128.6 对 121.8 FPS（+5.6%）；
+开/关截图差异在场景自身噪声内。
 
-### Copy shader merge distance
+### 拷贝着色器合并距离
 
-The HLE merged copies whose ranges fit in 64 MiB, and each merged batch synchronizes its whole
-source and destination range. With 64 KiB (`BB_COPY_MERGE_KB`): the copy shader's GPU time
-1.5 -> 0.6 ms/frame (profiler), GPU busy 85% -> ~77%, frame rate not lower (restarts vary
-125-142 FPS; 16 KiB and 256 KiB similar).
+HLE 会合并范围能装进 64 MiB 的拷贝，而每个合并后的批次要同步其整个源与目标范围。
+改为 64 KiB（`BB_COPY_MERGE_KB`）后：拷贝着色器的 GPU 时间 1.5 -> 0.6 ms/帧
+（profiler），GPU 忙碌 85% -> 约 77%，帧率未降低（重启间有波动，125–142 FPS；
+16 KiB 与 256 KiB 相近）。
 
-## Third round (2026-09-30, afternoon)
+## 第三轮（2026-09-30 下午）
 
-Frame rate at the level entrance, 16 threads, FSR 4 Ultra Performance: ~134 -> ~145-150 FPS
-(restarts vary by a few FPS; the A/B numbers below are from one run each).
+关卡入口处的帧率，16 线程，FSR 4 Ultra Performance：约 134 -> 约 145–150 FPS
+（重启间相差几个 FPS；下面的 A/B 数字各来自一次运行）。
 
-### Where stage A waits
+### stage A 在何处等待
 
-`Frame stats` now prints, next to the drain counts, the share of stage A's time each drain
-reason and each call site (`function:line`, `DrainDrawPipe` records `__builtin_LINE`) waited.
-Stage A waits ~25% of its time, almost all at one drain per frame: whichever drain comes first
-after a long stretch of draws waits for stage B to finish them. It was `DrawIndirect` (21%),
-then `DispatchIndirect`, then a `DumpConstRam` once those were pipelined. So stage A is faster
-than stage B, and removing drains helps only where it breaks the lockstep; stage B (85% busy,
-~2.8 µs per packet, flat profile) is the limit.
+`Frame stats` 现在在排空计数旁边，打印 stage A 的时间中各排空原因与各调用点
+（`function:line`，`DrainDrawPipe` 记录 `__builtin_LINE`）各占多少。
+stage A 约 25% 的时间在等待，几乎全在每帧一次的某次排空上：一长串 draw 之后
+最先到来的那次排空，要等 stage B 把它们跑完。最初是 `DrawIndirect`（21%），
+然后是 `DispatchIndirect`，那两者管线化之后轮到一次 `DumpConstRam`。
+所以 stage A 比 stage B 快，去掉排空只在打破这种锁步时才有帮助；
+stage B（85% 忙碌，每包约 2.8 µs，profile 平坦）才是瓶颈。
 
-- Indirect draws and dispatches are pipelined like direct ones (toggle 1 << 46): the pipeline is
-  selected on stage A, the argument buffer lookup and the indirect command are recorded on B.
-  +1.4%.
-- Pending GPU writes (the constant ring's guard) merge overlapping ranges and are pruned every
-  64th check instead of on every buffer: `PendingWriteOverlaps` 7.5% -> 3.6% of stage A; together
-  ~+4%.
-- Texture set memo: 32768 slots; a quarter of the misses were slot collisions (37k -> 11k per
-  5 s): +1.3%.
-- Motion history per-frame tables: open addressing instead of `std::unordered_map` (four node
-  allocations per stored draw, freed every frame). Neutral on FPS.
-- Tried: a release store instead of the sequentially consistent one in `DrawPipe::Commit` with a
-  timed futex sleep (+0.4%, not worth a possible missed wake-up; reverted).
+- 间接 draw 与 dispatch 已像直接 draw 一样管线化（toggle 1 << 46）：管线在 stage A
+  上选择，参数缓冲查找与间接命令在 B 上记录。+1.4%。
+- 待处理的 GPU 写入（常量环的守卫）合并重叠范围，并改为每 64 次检查修剪一次而非每次：
+  `PendingWriteOverlaps` 占 stage A 的 7.5% -> 3.6%；合计约 +4%。
+- 纹理集合 memo：32768 个 slot；四分之一的未命中是 slot 冲突（每 5 s 从 37k -> 11k）：
+  +1.3%。
+- 逐帧的运动历史表：改用开放寻址而非 `std::unordered_map`（每个存储的 draw 四次
+  节点分配，每帧释放）。对 FPS 中性。
+- 试过：在 `DrawPipe::Commit` 中用 release 存储替代顺序一致性存储，配带定时的
+  futex 休眠（+0.4%，不值得冒可能丢失唤醒的风险；已回退）。
 
-Object motion vectors cost ~10% FPS (155 vs 141 FPS with `object_motion=0`): stage B spends
-~0.28 µs more per packet, spread over DrawRecord (bone palette hashes, index range cache, motion
-pipeline variants).
+物体运动矢量约耗 10% FPS（155 对 141 FPS，`object_motion=0`）：stage B 每包多花
+约 0.28 µs，分摊在 DrawRecord各处（骨骼调色板哈希、索引范围缓存、运动管线变体）。
 
-### Scene resolution and the preset/GPU load question
+### 场景分辨率与预设/ GPU 负载问题
 
-GPU busy time per frame (profile total minus the idle time between submissions):
+每帧 GPU 忙碌时间（profile 总计减去提交之间的空闲）：
 
-| mode | GPU busy |
+| 模式 | GPU 忙碌 |
 |---|---|
-| upscaler off (native 1080p) | 3.67 ms |
+| 关闭超分（原生 1080p） | 3.67 ms |
 | FSR 4 Quality | 5.64 -> 5.50 ms |
 | FSR 4 Ultra Performance | 5.11 -> 4.98 -> 4.86 ms |
 
-Rasterizing the scene costs little on this GPU, so a lower preset saves ~0.5 ms, while FSR 4
-itself costs ~1.4 ms at 1080p output; FSR 4 Ultra Performance takes more GPU time than native
-rendering without an upscaler. Found on the way:
+在这款 GPU 上光栅化场景代价很低，所以更低的预设只省约 0.5 ms；而 FSR 4 本身在
+1080p 输出下耗约 1.4 ms —— FSR 4 Ultra Performance 的 GPU 时间比不开超分的原生
+渲染还多。过程中发现：
 
-- The reduced-size decision looked at all eight color slots, but slots past the mask width keep
-  earlier passes' targets — in the lighting passes the G-buffer images they sample. The light
-  accumulation passes stayed at 1920x1080 at every preset. Fixed (toggle 1 << 47 restores it).
-- Every pass that sampled a reduced target made the proxy be resampled to the native size first
-  (~25 resolves per frame, 0.4 ms; `BB_GPU_PROFILE` now labels resolves, fills, image uploads and
-  downloads). The recompiler marks images read by anything but normalized sampling without
-  offsets (`ImageResource::needs_native`); other sampled bindings read the proxy directly
-  (toggle 1 << 48): GPU busy 5.02 -> 4.86 ms, identical screenshots. Changes the `Info` layout:
-  shader meta version 7, pipeline key version 5 (caches rebuilt once).
-- `BB_SCENE_DEBUG=<file>`: touching the file prints the next frame's scene passes with the reason
-  each keeps the native size. What remains native before the upscaler: half-resolution
-  (960x540) passes, which `SceneTargets::Eligible` does not handle.
+- 降尺寸的判定看了全部八个颜色 slot，但超出 mask 宽度的 slot 会保留早期 pass 的目标 ——
+  在光照 pass 中就是它们所采样的 G-buffer image。因此光照累加 pass 在任何预设下都
+  停在 1920x1080。已修（toggle 1 << 47 可恢复旧行为）。
+- 每个采样降尺寸目标的 pass 此前都要先把代理重采样到原生尺寸
+  （每帧约 25 次 resolve，0.4 ms；`BB_GPU_PROFILE` 现在给 resolve、fill、image
+  上传与下载打标签）。重编译器会标记那些被非归一化采样（无 offset）读取的 image
+  （`ImageResource::needs_native`）；其他被采样的绑定直接读代理
+  （toggle 1 << 48）：GPU 忙碌 5.02 -> 4.86 ms，截图一致。这会改`Info` 布局：
+  shader meta 版本 7，管线键版本 5（缓存需重建一次）。
+- `BB_SCENE_DEBUG=<file>`：触碰该文件会打印下一帧的场景 pass 及各自保持原生尺寸的
+  原因。超分之前仍保持原生的：半分辨率（960x540）pass，`SceneTargets::Eligible`
+  尚未处理。
 
-Next GPU item (matters most on the Steam Deck): guest compute `3d5ebf4e` is a dword memcpy that
-copies render target memory (the 1080p depth buffer, 12 MB, sampled afterwards as R32F; a
-G-buffer target; two 960x540 targets): 8 dispatches, and each needs the image downloaded into
-the buffer, the proxy resolved and the destination image uploaded again. Recognizing copies
-whose source is an image and turning them into image copies (or a proxy-sized copy) would remove
-most of that. Skipping the dispatches blacks out the scene, so the copies are needed.
+下一个 GPU 项（对 Steam Deck 最重要）：客户 compute `3d5ebf4e` 是一次 dword memcpy，
+拷贝渲染目标内存（1080p 深度缓冲 12 MB，之后作为 R32F 被采样；一个 G-buffer 目标；
+两个 960x540 目标）：8 次 dispatch，每次都需要把 image 下载进缓冲、把代理 resolve、
+再把目标 image 上传回去。识别出源是 image 的拷贝并转为 image 拷贝（或按代理尺寸拷贝）
+可以消掉其中大部分。跳过这些 dispatch 会让场景变黑，所以拷贝是必需的。
 
-### Fixed: guest heap corruption with the draw pipeline (2026-10-01)
+### 已修：draw 管线导致的客户堆损坏（2026-10-01）
 
-Cause: GPU idle (`IrqC GpuIdle`, which releases `sceGnmSubmitDone`) was signalled once stage A had
-decoded every submission, while end-of-pipe fences deferred to the Vulkan recording thread
-(RecorderFences) were still pending; the guest freed the objects holding those labels while
-another of its threads still updated them. Stage A now drains the pipe and waits for the
-deferred signals before GPU idle (and before compute-queue WriteData/ReleaseMem). Found with
-`BB_WRITE_LOG=2` (fence targets logged at decode time, off the racing path). The notes below
-are the investigation.
+原因：GPU 空闲（`IrqC GpuIdle`，它释放 `sceGnmSubmitDone`）在 stage A 解码完每个
+提交后就被置位，而延迟到 Vulkan 录制线程的管末 fence（RecorderFences）仍未完成；
+客户释放了持有那些标签的对象，而它自己的另一个线程还在更新它们。
+现在 stage A 在GPU 空闲之前（以及在 compute 队列的 WriteData/ReleaseMem 之前）
+先排空管线并等待延迟信号。用 `BB_WRITE_LOG=2` 定位（在解码时记录 fence 目标，
+避开竞争路径）。以下是调查过程。
 
-#### Investigation notes
+#### 调查笔记
 
-After ~2-15 min at the level (camera turning, nobody moving) the guest faults at guest offset
-`0x263b8e7`: a free-list pop in a guest allocator reads the next pointer `0x0000005300000000`
-from a freed block, so something wrote into memory the game had already freed. Soak runs of
-15-20 min: with the draw pipeline 3 of 4 crashed (at 863, 844 s and one earlier), with
-`BB_DRAW_PIPE=0` 0 of 2. With `BB_WRITE_LOG=1` (slower downloads) one run survived 20 min.
+在关卡中待2–15 分钟后（相机转动，无人移动），客户在客户偏移 `0x263b8e7` 处故障：
+一个客户分配器的 freelist 弹出从已释放的块中读到下一个指针 `0x0000005300000000`，
+说明有什么东西写进了游戏已释放的内存。15–20 分钟的浸泡运行：启用 draw 管线时
+4 次中 3 次崩溃（分别在 863、844 s 与更早一次），`BB_DRAW_PIPE=0` 时 2 次中 0 次。
+用 `BB_WRITE_LOG=1`（下载更慢）时有一次运行撑过 20 分钟。
 
-Ruled out / done so far:
-- guest-visible writes overtaking deferred fences (now ordered: `WaitDeferredSignals`, toggle
-  1 << 49) — the crash remains;
-- the scene-proxy and texture-set changes: the crash also happened before them.
+已排除/迄今已做：
+- 客户可见写入越过延迟 fence（现已排序：`WaitDeferredSignals`，toggle 1 << 49）
+  —— 崩溃依旧；
+- 场景代理与纹理集合的改动：崩溃在它们之前也发生过。
 
-Candidates: late writes into guest memory that the pipeline delays further — asynchronous image
-downloads (`TextureCache::DownloadImageMemory`, deferred until the GPU finishes, whole image),
-buffer downloads on page faults, and fault handling when the GPU command thread (stage A), which
-now reads guest memory for the constant ring, is not treated as a GPU-side thread
-(`IsGpuSideThreadId` accepts only stage B). Next: a run with `BB_WRITE_LOG=1` that crashes
-prints which logged write landed near the corrupted block; bisect the pipeline toggles
-(38 tasks, 39 pending fence waits, 41 recorder fences, 42 memory writes, 36 constant ring).
+候选：管线进一步延迟的对客户内存的迟到写入 —— 异步 image 下载
+（`TextureCache::DownloadImageMemory`，延迟到 GPU 完成，整幅 image）、
+缺页时的缓冲下载，以及当 GPU 命令线程（stage A，现为常量环读取客户内存）
+未被当作 GPU 侧线程处理时的缺页处理（`IsGpuSideThreadId` 只接受 stage B）。
+下一步：一次带 `BB_WRITE_LOG=1` 的崩溃运行会打印哪次被记录的写入落在损坏块附近；
+二分各管线 toggle（38 任务、39 pending fence 等待、41 录制器 fence、42 内存写入、
+36 常量环）。

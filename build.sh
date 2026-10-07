@@ -70,7 +70,10 @@ if ! ninja -C out/gpu bbgpu > out/gpu-build.log 2>&1; then
     echo 'GPU library build failed (full log: out/gpu-build.log)' >&2; exit 1
 fi
 # $ORIGIN/gpu: packaged copies keep the library next to the binary without patching it.
-gpu=(-Lout/gpu -lbbgpu -Wl,-rpath,'$ORIGIN/gpu' -Wl,-rpath,"$PWD/out/gpu" -rdynamic)
+# -rdynamic is a GCC/lld spelling that clang rejects outright ("argument unused"), and the
+# Windows path below replaces this array anyway; the portable spelling is --export-dynamic,
+# which lld accepts on both toolchains.
+gpu=(-Lout/gpu -lbbgpu -Wl,-rpath,'$ORIGIN/gpu' -Wl,-rpath,"$PWD/out/gpu" -Wl,--export-dynamic)
 runtime=(src/runtime*.c)
 link=(-no-pie)
 res=()
@@ -105,13 +108,25 @@ echo "Built $PWD/out/bb-probe"
 "$CC" "${cstd[@]}" -O2 -Wall -Wextra -Werror tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
 fi
 if [[ ${1:-} == --test ]]; then
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" -o out/pad-test
-    out/pad-test
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
+    # runtime_file.c reaches the host through these on Windows (posix_pread/pwrite/rename and
+    # inet_pton/ntop); without them the link fails on undefined Win32 shims.
+    win_compat=()
+    [[ -n $windows ]] && win_compat=(src/win32_compat.c)
+    # The main binary links ${link[@]} (on Windows: ASLR off, so the fixed guest address
+    # space at 0x800000000 is still free when runtime_memory reserves it). Tests that link
+    # runtime_memory.c need the same treatment or the reservation fails with error 487.
+    # test_pad.c is POSIX-shaped (mkdtemp/setenv/usleep); it only builds where those exist.
+    if [[ -z $windows ]]; then
+        "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" -o out/pad-test
+        out/pad-test
+    else
+        echo 'skipping test_pad (POSIX-only: mkdtemp/setenv); run it on Linux' >&2
+    fi
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" "${link[@]}" -o out/runtime-test
     out/runtime-test
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_file_mods.c -o out/file-mods-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_file_mods.c "${win_compat[@]}" "${libraries[@]}" "${link[@]}" -o out/file-mods-test
     out/file-mods-test
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sema-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" "${link[@]}" -o out/sema-test
     out/sema-test
     "$CC" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
     out/content-test
