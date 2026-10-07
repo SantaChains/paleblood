@@ -490,12 +490,15 @@ public:
         return supports_memory_budget;
     }
 
-    /// Returns the amount of memory used.
-    [[nodiscard]] u64 GetDeviceMemoryUsage() const;
-
-    /// bbport: the driver's current budget of the heaps GetDeviceMemoryUsage counts
-    /// (VK_EXT_memory_budget: what this process can use now, other processes included).
-    [[nodiscard]] u64 GetDeviceMemoryBudgetNow() const;
+    /// Driver-reported memory use of the heaps the allocator draws from, in one query.
+    struct DeviceMemoryStatus {
+        u64 usage = 0;  ///< heapUsage summed over valid heaps
+        u64 budget = 0; ///< heapBudget summed over valid heaps: what this process may use
+                        /// now, other processes included (VK_EXT_memory_budget)
+    };
+    /// One getMemoryProperties2 call per invocation; the texture-cache GC needs both fields
+    /// on every pass.
+    [[nodiscard]] DeviceMemoryStatus GetDeviceMemoryStatus() const;
 
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {

@@ -1124,7 +1124,6 @@ TextureCache::GcStats TextureCache::GetGcStats() const {
 
 void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
         // bbport: compare against the driver's *live* budget, not the startup one.
         //
         // Why all GPUs and not only integrated ones: the startup budget (GetTotalMemoryBudget)
@@ -1148,7 +1147,8 @@ void TextureCache::GarbageCollectImages() {
         // past what the device actually tolerates.
         const int budget_mb = BbSettings::Get().gc_budget_mb.load();
         const u64 forced_budget = budget_mb > 0 ? u64(budget_mb) << 20 : 0;
-        const u64 driver = instance.GetDeviceMemoryBudgetNow();
+        const auto [usage, driver] = instance.GetDeviceMemoryStatus();
+        total_used_memory = usage;
         const u64 budget =
             forced_budget ? (driver && driver < forced_budget ? driver : forced_budget) : driver;
         if (budget != 0) {
