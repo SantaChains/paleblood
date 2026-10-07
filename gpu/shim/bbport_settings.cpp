@@ -2,6 +2,8 @@
 #include "bbport_settings.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -10,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace BbSettings {
@@ -406,9 +409,19 @@ void Save() {
         return;
     }
     std::fclose(file);
-    if (std::rename(tmp.c_str(), target.c_str()) != 0) {
+    // Windows' rename fails when any process holds the target open (antivirus/indexer/
+    // launcher reads are transient, usually well under a second), where POSIX replaces
+    // atomically regardless. Retry across a one-second window before giving up; giving up
+    // is safe — the target is untouched, only this save's values are not persisted.
+    bool replaced = std::rename(tmp.c_str(), target.c_str()) == 0;
+    for (int attempt = 0; !replaced && attempt < 10; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        replaced = std::rename(tmp.c_str(), target.c_str()) == 0;
+    }
+    if (!replaced) {
+        std::printf("Settings: cannot replace %s: %s\n", target.c_str(),
+                    std::strerror(errno));
         std::remove(tmp.c_str());
-        std::printf("Settings: cannot replace %s\n", target.c_str());
     }
 }
 
