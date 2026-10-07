@@ -282,7 +282,14 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     pthread_attr_destroy(&host);
 #endif
     if (e) { fprintf(stderr,"STOP: host thread creation failed: %d\n",e); exit(21); }
-    if (t->detached) host_thread_detach(t->host);
+    /* The initial detach for a detached attr claims the flag under the lock, same as
+     * thread_detach: published handles are reachable now, so the claim is what prevents the
+     * creator's detach and a concurrent guest detach from both hitting the host handle. */
+    int initial_detached;
+    host_lock(&lock);
+    initial_detached=t->detached; t->detached=1;
+    host_unlock(&lock);
+    if (initial_detached) host_thread_detach(t->host);
     host_lock(&lock); ++created; host_unlock(&lock);
     printf("Runtime: guest thread '%s' created (stack=%llu, prio=%d)\n",t->name,(unsigned long long)stack,t->attr.prio);
     return 0;
@@ -293,8 +300,16 @@ static ABI int32_t thread_create(GuestThread **out,ThreadAttr **attr,GuestEntry 
 static ABI int32_t thread_join(GuestThread *t,void **result) {
     if (!find_thread(t) || t->host_owned) return ERR(3);
     if (t==current) return ERR(11);
-    if (t->detached || t->joined) return ERR(22);
+    /* Claim the join under the lock, then join outside it: two guest threads joining the
+     * same target would otherwise both pass the check and call host_thread_join twice —
+     * the second returns non-zero and exits the process. The lock also serializes against
+     * thread_detach, which is a POSIX-legal concurrent pairing; claiming is what makes it
+     * safe. Joining while holding the lock itself would deadlock: the target thread takes
+     * the same lock to mark itself finished. */
+    host_lock(&lock);
+    if (t->detached || t->joined) { host_unlock(&lock); return ERR(22); }
     t->joined=1;
+    host_unlock(&lock);
     int e=host_thread_join(t->host);
     if (e) { fprintf(stderr,"STOP: host thread join failed: %d\n",e); exit(21); }
     if (result) *result=t->result;
@@ -303,8 +318,13 @@ static ABI int32_t thread_join(GuestThread *t,void **result) {
 }
 static ABI int32_t thread_detach(GuestThread *t) {
     if (!find_thread(t)) return ERR(3);
-    if (t->detached) return ERR(22);
+    /* Same claim discipline as thread_join: refused once a join has been claimed (the host
+     * handle is about to be reaped), and double-detach becomes a clean EINVAL instead of a
+     * second host_thread_detach on the same handle. */
+    host_lock(&lock);
+    if (t->detached || t->joined) { host_unlock(&lock); return ERR(22); }
     t->detached=1;
+    host_unlock(&lock);
     if (!t->host_owned) host_thread_detach(t->host);
     return 0;
 }
