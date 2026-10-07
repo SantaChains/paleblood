@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <vector>
 #include <chrono>
@@ -32,6 +33,12 @@ extern std::atomic<u32> g_bb_compiles;
 } // namespace Vulkan
 
 namespace Libraries::VideoOut {
+
+namespace {
+/// Pending Present lambdas the swap thread may hold: one in flight plus one queued. See
+/// RunPresenter for the drop-oldest policy this bound feeds.
+constexpr size_t kMaxSwapQueue = 2;
+} // namespace
 
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
     switch (format) {
@@ -77,6 +84,27 @@ void VideoOutDriver::RunPresenter(std::function<void()> work, bool if_idle) {
         std::scoped_lock lock{swap_mutex};
         if (if_idle && (swap_busy || !swap_queue.empty())) {
             return; // a redraw of the last frame is pointless while frames are queued
+        }
+        // Bounded queue with drop-oldest: when presentation is slower than submission
+        // (frame limit above what the display accepts, a slow driver present), the queue
+        // used to grow without limit and input-to-photon latency climbed with every stale
+        // frame waiting in it. Dropping is safe here: flip accounting (flip_status,
+        // flip_pending_num, the game's equeue events) happens in Flip() on the present
+        // thread, not in these lambdas — a queued lambda is only SetHDR + Present, and the
+        // newest one re-applies the HDR state of its own request. One slot in flight plus
+        // one queued keeps the freshest frame without ever presenting two behind.
+        while (swap_queue.size() >= kMaxSwapQueue) {
+            swap_queue.pop_front();
+            static std::atomic<u64> swap_dropped{0};
+            static std::chrono::steady_clock::time_point last_drop_log{};
+            const u64 dropped = swap_dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_drop_log > std::chrono::seconds(5)) {
+                last_drop_log = now;
+                std::printf("VideoOut: presents arriving faster than the display takes them, "
+                            "%llu dropped so far\n",
+                            static_cast<unsigned long long>(dropped));
+            }
         }
         swap_queue.push_back(std::move(work));
     }
