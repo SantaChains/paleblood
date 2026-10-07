@@ -139,9 +139,11 @@ void SetOpen(bool value) {
         std::thread([] {
             std::scoped_lock lock{imgui_mutex};
             if (initialized) {
-                // No default argument in this version: the null means "use io.IniFilename",
-                // which is what the automatic IniSavingRate path does.
-                ImGui::SaveIniSettingsToDisk(nullptr);
+                // No fallback to io.IniFilename here: SaveIniSettingsToDisk(nullptr) returns
+                // after zeroing the dirty timer (imgui.cpp:15852-15855), so the null form
+                // would cancel the pending auto-save AND write nothing — edits made within
+                // IniSavingRate of closing the menu would be lost. Pass the path explicitly.
+                ImGui::SaveIniSettingsToDisk(ImGui::GetIO().IniFilename);
             }
         }).detach();
         std::thread([] { BbSettings::Save(); }).detach();
@@ -1473,7 +1475,7 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
         }
     }
     if (!cjk_merged) {
-        std::printf("Overlay: no system CJK font, Chinese menu text will show boxes\n");
+        std::printf("Overlay: no system CJK font, Chinese menu text will render as '?'\n");
     }
 #endif
 
@@ -1528,6 +1530,10 @@ void OnFormatChange(vk::Format format) {
     backend_format = static_cast<VkFormat>(format);
     if (!ImGui_ImplVulkan_Init(&backend_info)) {
         initialized = false;
+        // The menu dies with the backend, and the UI state must die with it: menu_open stuck
+        // true would keep CapturesInput() eating the game's input while every close hotkey is
+        // dead (HandleEvent early-returns on !initialized) — no way out but a restart.
+        menu_open = false;
         ImGui::DestroyContext();
         std::printf("Overlay: ImGui Vulkan backend rebuild failed\n");
         return;
@@ -1558,6 +1564,13 @@ bool HandleEvent(const SDL_Event& event) {
     ImGuiIO& io = ImGui::GetIO();
     const bool is_open = menu_open;
     switch (event.type) {
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+    case SDL_EVENT_WINDOW_MINIMIZED:
+        // Alt-tab with the menu open: without this the held keys stay latched in ImGui's
+        // state (io.ClearInputKeys is otherwise only called on menu close) and the game
+        // receives phantom movement after refocusing.
+        io.ClearInputKeys();
+        return false;
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
