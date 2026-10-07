@@ -153,6 +153,11 @@ private:
     std::atomic<u64> latency_sleep_value{0};
     std::atomic<bool> latency_sleep_armed{false};
     std::atomic<bool> latency_broken{false}; ///< a sleep never signalled: pause the feature
+    /// Backoff bookkeeping for the recovery probe (see ApplyLatencyMode): when the failure
+    /// happened (steady_clock ns) and how many consecutive probes failed. Probes re-arm the
+    /// feature at 2s, 4s, 8s, 16s, then every 30s; a signalled sleep resets the count.
+    std::atomic<s64> latency_broken_since_ns{0};
+    std::atomic<u32> latency_broken_retries{0};
     std::atomic<bool> latency_mode_on{false}; ///< presenter mirror of the user toggle
     std::atomic<u64> present_id_counter{0};
 };

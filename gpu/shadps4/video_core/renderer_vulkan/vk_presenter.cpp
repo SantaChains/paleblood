@@ -384,7 +384,17 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         if (instance.GetDevice().waitSemaphores(&wait_info, 1'000'000'000ull) !=
             vk::Result::eSuccess) {
             LOG_WARNING(Render_Vulkan, "Low latency sleep never signalled; pausing the feature");
+            // Mark when the failure happened and count it: ApplyLatencyMode re-arms the
+            // feature after a backoff, and a probe that succeeds must reset the backoff.
             latency_broken.store(true);
+            latency_broken_retries.fetch_add(1, std::memory_order_relaxed);
+            latency_broken_since_ns.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count(),
+                std::memory_order_relaxed);
+        } else {
+            latency_broken_retries.store(0, std::memory_order_relaxed);
         }
     }
     if (LowLatency()) {
@@ -616,8 +626,25 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     const bool ll_was_on = latency_mode_on.exchange(want_ll);
     if (want_ll && !ll_was_on) {
         latency_broken.store(false);
+        latency_broken_retries.store(0, std::memory_order_relaxed);
     } else if (!want_ll && ll_was_on) {
         latency_sleep_armed.store(false);
+    } else if (want_ll && ll_was_on && latency_broken.load()) {
+        // Recovery probe with exponential backoff. A transient failure (mode switch,
+        // driver stress window) used to silence the feature until the user re-toggled it;
+        // re-arming from here hands control back once the driver recovers. A probe that
+        // fails costs one up-to-1s wait in PrepareFrame, hence the growing cadence
+        // (2s, 4s, 8s, 16s, capped at 30s) instead of spinning on timeouts.
+        const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+        const u32 retries = latency_broken_retries.load(std::memory_order_relaxed);
+        const s64 interval = std::min<s64>(2'000'000'000ll << std::min<u32>(retries, 4),
+                                           30'000'000'000ll);
+        if (now_ns - latency_broken_since_ns.load(std::memory_order_relaxed) >= interval) {
+            latency_broken.store(false);
+            LOG_INFO(Render_Vulkan, "Low latency: retrying after a previous sleep timeout");
+        }
     }
     swapchain.ApplyLatencyMode(want_ll);
     if (LowLatency()) {
