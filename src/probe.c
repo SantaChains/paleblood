@@ -821,9 +821,13 @@ int main(int argc, char **argv) {
      * (e.g. CUSA03023 caves at 0x50db8xx, between the 0x50d96dc and 0x50dc000 segment ends).
      * The PS4 kernel and shadPS4 map the whole span, so those pages are live and executable:
      * merge each gap into the preceding segment so validation, protection and the exec-page
-     * test of runtime_cheat_write all see it. Segment tables are sorted by address. */
+     * test of runtime_cheat_write all see it. The merge assumes the table is sorted and
+     * non-overlapping — the ELF program headers guarantee it, but a corrupt or hand-built
+     * boot file must be rejected here rather than producing a reversed size (end < start)
+     * or a protect() over a wrong range later. */
     for (uint64_t i = 0; i + 1 < ns; ++i) {
         const uint64_t end = segments[i].address + segments[i].size;
+        if (segments[i+1].address < end) fail("overlapping segments");
         if (end < segments[i+1].address) segments[i].size = segments[i+1].address - segments[i].address;
     }
     if (fread(names, 128, import_count, f) != import_count) fail("truncated import names");
