@@ -79,6 +79,7 @@ jobs:
             ninja
             python
             pkgconf
+            mingw-w64-clang-x86_64-cmake
             mingw-w64-clang-x86_64-boost
             mingw-w64-clang-x86_64-vulkan-headers
             mingw-w64-clang-x86_64-vulkan-loader
@@ -92,7 +93,11 @@ jobs:
             mingw-w64-clang-x86_64-sdl3
 
       - name: Build
-        run: ./build.sh
+        run: |
+          # clang64 的 cmake（Windows 语义，WIN32=true）必须压过 /usr/bin 的 msys 版：
+          # msys cmake 走 else（Linux）分支，会去 REQUIRED X11 而不是 FetchContent。
+          command -v cmake
+          ./build.sh
 
       - name: Collect release payload
         run: python tools/make_release.py --version "${{ needs.version.outputs.version }}"
