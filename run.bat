@@ -14,8 +14,17 @@ rem read the user variable from the registry instead of trusting the inherited o
 if not defined BB_MSYS2 for /f "tokens=2,*" %%a in ('reg query HKCU\Environment /v BB_MSYS2 2^>nul ^| findstr BB_MSYS2') do set "BB_MSYS2=%%b"
 if not defined BB_MSYS2 set "BB_MSYS2=C:\msys64"
 set "BB_PYTHON=%BB_MSYS2%\clang64\bin\python.exe"
+rem MSYS2 is only needed to BUILD. The launch chain is pure standard-library Python, so a
+rem release-zip user (no MSYS2) runs it with any system Python instead. where resolves the
+rem full path so the quoted call below stays valid.
 if not exist "%BB_PYTHON%" (
-    echo MSYS2 Python not found at %BB_PYTHON%. Install MSYS2 and the packages listed in README.md, or set BB_MSYS2.
+    for /f "delims=" %%i in ('where py 2^>nul') do (set "BB_PYTHON=%%i" & goto have_py)
+    for /f "delims=" %%i in ('where python 2^>nul') do (set "BB_PYTHON=%%i" & goto have_py)
+)
+:have_py
+if not exist "%BB_PYTHON%" (
+    echo No usable Python found. Install MSYS2 (see README.md) to build, or put any
+    echo Python 3.8+ on PATH to run a release zip.
     pause
     exit /b 1
 )

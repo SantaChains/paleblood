@@ -1,0 +1,71 @@
+# Builds the Windows port and publishes a self-contained release zip on every v* tag.
+# The payload is verified end-to-end before tagging: tools/make_release.py collects the
+# runtime artifacts, and the launch chain was tested against a game dump from the unpacked
+# zip (boot image, patches and content profile are all derived on the user's machine, so
+# nothing Sony-owned ships here).
+#
+# Manual runs: Actions -> release -> Run workflow (dropdown picks the tag or branch).
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write # the release upload
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same toolchain build.bat expects locally: clang64 clang/cmake/ninja/python plus
+      # the headers and libraries gpu/CMakeLists.txt finds through pkg-config and find_program
+      # (glslang for the compute shaders, vma for the allocator, boost for asio, SDL3 for the
+      # window backend whose SDL3.dll ships in the zip).
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: false
+          install: >-
+            make
+            git
+            clang
+            cmake
+            ninja
+            python
+            pkgconf
+            glslang
+            mingw-w64-clang-x86_64-toolchain
+            mingw-w64-clang-x86_64-boost
+            mingw-w64-clang-x86_64-vulkan-headers
+            mingw-w64-clang-x86_64-vulkan-memory-allocator
+            mingw-w64-clang-x86_64-vulkan-validation-layers
+            mingw-w64-clang-x86_64-SDL3
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Test
+        run: ./build.sh --test
+
+      - name: Collect release payload
+        run: python tools/make_release.py --version "${GITHUB_REF_NAME#v}"
+
+      - name: Upload artifact (always, even on manual runs without a tag)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bbport-win64
+          path: out/release/bbport-*-win64.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/release/bbport-*-win64.zip
+          generate_release_notes: true

@@ -56,7 +56,7 @@ def build():
                                 stdout=file, stderr=subprocess.STDOUT)
     if result.returncode:
         print(f'build.sh failed, log tail (full: {log}):', file=sys.stderr)
-        print(file.read_text(errors='replace')[-4000:], file=sys.stderr)
+        print(log.read_text(errors='replace')[-4000:], file=sys.stderr)
         sys.exit(result.returncode)
 
 
