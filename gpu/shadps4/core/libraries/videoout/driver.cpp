@@ -477,22 +477,34 @@ void VideoOutDriver::Flip(const Request& req) {
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
+            // 1% Low uses the industry reading — the mean flip time of the worst 1% (at least
+            // one) frame, inverted — so it speaks the player's units. jank counts flips over
+            // the project's stall threshold (40 ms, the same line that triggers the Stall
+            // dump): the relative 1.5x-median spike count misses stalls when the median is low.
             if (intervals.size() > 2) {
                 std::vector<double> sorted = intervals;
                 std::sort(sorted.begin(), sorted.end());
                 const double median = sorted[sorted.size() / 2];
                 double sum = 0, sq = 0;
-                u32 spikes = 0;
+                u32 spikes = 0, jank = 0;
                 for (const double ms : intervals) {
                     sum += ms;
                     sq += ms * ms;
                     spikes += ms > 1.5 * median;
+                    jank += ms > 40.0;
                 }
                 const double mean = sum / intervals.size();
+                const size_t worst_one = std::max<size_t>(1, sorted.size() / 100);
+                double worst_sum = 0;
+                for (size_t i = sorted.size() - worst_one; i < sorted.size(); ++i) {
+                    worst_sum += sorted[i];
+                }
+                const double low_one = 1000.0 / (worst_sum / worst_one);
                 std::printf("Frame pacing: median %.2f ms, stddev %.2f ms, p99 %.2f ms, "
-                            "%u frames over 1.5x median\n",
+                            "1%% Low %.1f FPS, %u frames over 1.5x median, jank(>40ms) %u\n",
                             median, std::sqrt(std::max(0.0, sq / intervals.size() - mean * mean)),
-                            sorted[std::min(sorted.size() - 1, sorted.size() * 99 / 100)], spikes);
+                            sorted[std::min(sorted.size() - 1, sorted.size() * 99 / 100)], low_one,
+                            spikes, jank);
             }
             intervals.clear();
             window_start = now;
