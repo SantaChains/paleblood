@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1962,21 +1963,28 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image 
     // the published pointer must stay valid while the message does. The previous form copied
     // into a std::array<std::string, 8> ring and published kept[next].c_str(): assigning into a
     // reused slot can reallocate the string, leaving fsr4_problem dangling at freed memory that
-    // the present thread then reads. One fixed-size slot is enough — the value is only ever read
-    // between two Record calls, and it changes at most when the upscaler changes state, so
-    // there is nothing to gain from a ring and a stable address to lose.
-    static std::array<char, kMaxProblemLen> kept{};
+    // the present thread then reads.
+    //
+    // Two fixed-size slots and an atomic index instead: this thread (the GPU command thread)
+    // only ever writes the back slot and then publishes it, while the menu reads the published
+    // one under the overlay lock — the text the menu renders is always one whole message (old
+    // or new), never a torn mix, and both addresses are stable for the process lifetime.
+    static std::array<std::array<char, kMaxProblemLen>, 2> kept{};
+    static std::atomic<u32> published{0}; // the slot the menu may read
     const char* problem = use_dlss ? dlss->Problem() : fsr4->Problem();
     if (!problem) {
         BbSettings::Get().fsr4_problem = nullptr;
-    } else if (std::strncmp(kept.data(), problem, kMaxProblemLen - 1) != 0) {
-        // Bounded copy, always terminated: a message longer than the slot is truncated
-        // rather than left unterminated. The old length is kept when the new one is a prefix.
-        std::strncpy(kept.data(), problem, kMaxProblemLen - 1);
-        kept[kMaxProblemLen - 1] = '\0';
-    }
-    if (problem) {
-        BbSettings::Get().fsr4_problem = kept.data();
+    } else {
+        const u32 back = published.load(std::memory_order_relaxed) ^ 1u;
+        if (std::strncmp(kept[back].data(), problem, kMaxProblemLen - 1) != 0) {
+            // Bounded copy, always terminated: a message longer than the slot is truncated
+            // rather than left unterminated. The old length is kept when the new one is a
+            // prefix — strncpy zero-pads the remainder.
+            std::strncpy(kept[back].data(), problem, kMaxProblemLen - 1);
+            kept[back][kMaxProblemLen - 1] = '\0';
+        }
+        BbSettings::Get().fsr4_problem = kept[back].data();
+        published.store(back, std::memory_order_release);
     }
     if (!ok && (use_dlss ? dlss->Fatal() : fsr4->Fatal())) {
         std::printf("Upscaler: falling back to FSR 3.1\n");
