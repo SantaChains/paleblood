@@ -46,9 +46,26 @@ int win_mem_space(uintptr_t start, uintptr_t end) {
     }
     if (virtual_alloc2(GetCurrentProcess(), (void *)start, end - start, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
                        PAGE_NOACCESS, NULL, 0) != (void *)start) {
+        /* One short retry burst: injected DLLs (overlay/AV/RTSS) and the GPU driver's own VA
+         * reservations can transiently occupy pages inside the fixed range, and allocation
+         * happens lazily at the guest's first direct-memory call, after driver init. */
+        for (int attempt = 0; attempt < 5 && GetLastError() == ERROR_INVALID_ADDRESS; ++attempt) {
+            Sleep(200);
+            if (virtual_alloc2(GetCurrentProcess(), (void *)start, end - start,
+                               MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0)
+                == (void *)start) {
+                goto reserved;
+            }
+        }
         report("reserving the guest address space", start, end);
-        return -1;
+        /* Fail hard instead of degrading: space() failing makes runtime_low_map return NULL,
+         * allocations fall back to arbitrary addresses above 40 bits, and the guest's packed
+         * pointer assumptions break with far-off crashes that look nothing like this. */
+        fputs("STOP: cannot reserve the guest address space; close overlay/recording software "
+              "that may occupy it, or see stderr above\n", stderr);
+        exit(21);
     }
+reserved:
     space_start = start; space_end = end;
     return 0;
 }
