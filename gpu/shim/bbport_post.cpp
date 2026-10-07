@@ -286,12 +286,18 @@ bool Prepare(u32 w, u32 h, vk::Format surface_format) {
     if (failed || !instance || !Active()) {
         return false;
     }
-    if (surface_format == vk::Format::eB8G8R8A8Srgb ||
-        surface_format == vk::Format::eR8G8B8A8Srgb) {
+    // The work images are R8G8B8A8Unorm and the passes blit through them, so the swapchain
+    // format must be in the same 4x8 blit-compatible class. sRGB is excluded separately
+    // (texelFetch would decode what the final blit does not re-encode); the 10-10-10-2 HDR
+    // formats are a different class and vkCmdBlitImage across classes is a validation error.
+    const bool class_4x8 = surface_format == vk::Format::eB8G8R8A8Unorm ||
+                           surface_format == vk::Format::eR8G8B8A8Unorm;
+    if (!class_4x8) {
         static bool warned = false;
         if (!warned) {
             warned = true;
-            std::printf("BbPost: sRGB swapchain, post chain disabled\n");
+            std::printf("BbPost: swapchain format %d is not in the 4x8 blit class, post chain disabled\n",
+                        static_cast<int>(surface_format));
         }
         return false;
     }
