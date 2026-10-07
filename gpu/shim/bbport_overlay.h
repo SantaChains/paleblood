@@ -22,7 +22,7 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count);
 
 /// Swap thread, after the device was idled for a format change (HDR toggle):
 /// rebuilds the backend's pipeline for the new swapchain format.
-void OnFormatChange(vk::Format format);
+void OnSwapchainChanged(vk::Format format, u32 image_count);
 
 /// Window thread, for every SDL event: true when the menu consumed it.
 bool HandleEvent(const SDL_Event& event);

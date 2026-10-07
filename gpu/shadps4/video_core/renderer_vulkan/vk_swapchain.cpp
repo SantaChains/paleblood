@@ -84,6 +84,17 @@ void Swapchain::Create(u32 width_, u32 height_) {
     SetupImages();
     RefreshSemaphores();
     latency_mode_applied = false;
+
+    // The overlay's Vulkan backend sizes its vertex/index buffer ring from the image count
+    // and binds its dynamic rendering to the surface format; both can change across a
+    // recreation (HDR toggle, different surface caps). Report changes so the backend
+    // rebuilds instead of running with a stale buffer count (a stale one lets an in-flight
+    // frame reuse a ring slot another frame still renders from).
+    if (format.format != overlay_format || image_count != overlay_image_count) {
+        overlay_format = format.format;
+        overlay_image_count = image_count;
+        BbOverlay::OnSwapchainChanged(format.format, image_count);
+    }
 }
 
 void Swapchain::Recreate(u32 width_, u32 height_) {
@@ -105,8 +116,8 @@ void Swapchain::SetHDR(bool hdr) {
 
     needs_hdr = hdr;
     Recreate(width, height);
-    BbOverlay::OnFormatChange(needs_hdr ? SURFACE_FORMAT_HDR.format
-                                        : surface_format.format);
+    // The overlay is informed by Create() itself: it sees the new format and image count in
+    // one place, so a recreation that changes either (not only HDR) rebuilds the backend.
 }
 
 bool Swapchain::AcquireNextImage() {

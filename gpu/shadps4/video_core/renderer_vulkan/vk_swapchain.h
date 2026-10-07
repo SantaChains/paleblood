@@ -133,6 +133,10 @@ private:
     u32 width = 0;
     u32 height = 0;
     u32 image_count = 0;
+    /// Values last reported to BbOverlay (whose Vulkan backend sizes its per-frame buffer
+    /// ring from the image count); Create() re-reports when either changes.
+    vk::Format overlay_format{};
+    u32 overlay_image_count = 0;
     u32 image_index = 0;
     u32 frame_index = 0;
     bool needs_recreation = true;

@@ -90,6 +90,7 @@ float MenuEase() {
 // The Vulkan backend: kept so a swapchain format change (HDR toggle) can rebuild it.
 ImGui_ImplVulkan_InitInfo backend_info{};
 VkFormat backend_format = VK_FORMAT_UNDEFINED; // points into PipelineRenderingCreateInfo
+u32 backend_image_count = 0; // the swapchain image count the backend's buffer ring was sized for
 
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
@@ -1536,18 +1537,26 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
         return;
     }
     backend_info = info;
+    backend_image_count = image_count;
     initialized = true;
     std::printf("Overlay: menu ready (Insert or L3+R3)\n");
 }
 
-void OnFormatChange(vk::Format format) {
+void OnSwapchainChanged(vk::Format format, u32 image_count) {
     std::scoped_lock lock{imgui_mutex};
-    if (!initialized || static_cast<VkFormat>(format) == backend_format) {
+    if (!initialized ||
+        (static_cast<VkFormat>(format) == backend_format && image_count == backend_image_count)) {
         return;
     }
-    // The device was idled by Swapchain::SetHDR before this: no backend work is in flight.
+    // The device was idled by the swapchain teardown before this: no backend work is in flight.
     ImGui_ImplVulkan_Shutdown();
     backend_format = static_cast<VkFormat>(format);
+    // The backend sizes its per-frame vertex/index buffer ring from ImageCount and only reads
+    // it at Init time, so a changed swapchain image count must reach it here — a stale count
+    // means an in-flight frame reusing a buffer another frame still renders from.
+    backend_info.MinImageCount = std::max(image_count, 2u);
+    backend_info.ImageCount = std::max(image_count, 2u);
+    backend_image_count = image_count;
     if (!ImGui_ImplVulkan_Init(&backend_info)) {
         initialized = false;
         // The menu dies with the backend, and the UI state must die with it: menu_open stuck
