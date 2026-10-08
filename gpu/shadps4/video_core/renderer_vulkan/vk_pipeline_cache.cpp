@@ -13,6 +13,7 @@
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -521,7 +522,16 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
                           !regs.color_buffers[Shader::MotionVectors::Output] &&
                           regs.depth_buffer.DepthValid() &&
                           regs.depth_buffer.NumSamples() == 1 && !regs.IsClipDisabled() &&
-                          regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs;
+                          regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs &&
+                          // Keep the key and the ObjectMotion instance in agreement: the
+                          // instance's enabled state (settings, upscaler, feature/buffer
+                          // success) is fixed at construction, and flipping these in the
+                          // menu must not render a motion MRT the instance never set up.
+                          // A flip takes effect after a restart, like other restart-gated
+                          // settings (positions_address != 0 already blocks the reverse
+                          // direction: enabled=false leaves it at zero).
+                          BbSettings::Get().object_motion &&
+                          BbSettings::Get().upscaler != BbSettings::UpscalerOff;
     }
     sel.motion = false;
 

@@ -197,6 +197,12 @@ void ObjectMotion::EnsureImage(u32 width, u32 height) {
 }
 
 void ObjectMotion::Attach(RenderState& state, u32 width, u32 height) {
+    // key.motion_vectors is normally gated by positions_address != 0 (pipeline_cache), but
+    // that static survives settings flips: guard here too, so a stale key can never make a
+    // pipeline render into a motion image whose backing buffers were never created.
+    if (!enabled) {
+        return;
+    }
     constexpr u32 slot = Shader::MotionVectors::Output;
     EnsureImage(width, height);
     auto& attachment = state.color_attachments[slot];
