@@ -13,6 +13,9 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 EBOOT_BASE=0x400000
+# probe.c (BBPATCH2) reads each write into a 4096-byte buffer and fails startup on an empty
+# or oversized entry: enforce the contract here, by name, instead of failing at launch.
+PATCH_WRITE_LIMIT=4096
 # Where the community patch set comes from. Not redistributed here (see .gitignore for why):
 # every author credited in the file kept their rights, and shadps4-emu/ps4_cheats carries no
 # LICENSE, so fetching is the user's step. Note that ps4_cheats is the origin of most of these
@@ -171,22 +174,26 @@ def eboot_segments(elf):
     return segments
 
 
-def encode(line):
+def encode(line, name):
     kind,value=line.get('Type'),line.get('Value')
     if not kind or value is None:
         raise ValueError('patch line is missing Type or Value')
-    if kind=='bytes': return bytes.fromhex(value.replace(' ',''))
-    if kind in ('bytes16','bytes32','bytes64'):
+    if kind=='bytes': data=bytes.fromhex(value.replace(' ',''))
+    elif kind in ('bytes16','bytes32','bytes64'):
         width=int(kind[5:])//8
         number=int(value,0)
         if not 0<=number<1<<width*8:
             raise ValueError(f'{kind} value {value!r} does not fit {width} bytes')
-        return number.to_bytes(width,'little')
-    if kind=='float32': return struct.pack('<f',float(value))
-    if kind=='float64': return struct.pack('<d',float(value))
-    if kind=='utf8': return value.encode()+b'\0'
-    if kind=='utf16': return value.encode('utf-16-le')+b'\0\0'
-    raise ValueError(f'unsupported patch type {kind!r}')
+        data=number.to_bytes(width,'little')
+    elif kind=='float32': data=struct.pack('<f',float(value))
+    elif kind=='float64': data=struct.pack('<d',float(value))
+    elif kind=='utf8': data=value.encode()+b'\0'
+    elif kind=='utf16': data=value.encode('utf-16-le')+b'\0\0'
+    else: raise ValueError(f'unsupported patch type {kind!r}')
+    if not 0<len(data)<=PATCH_WRITE_LIMIT:
+        raise ValueError(f'{name}: write is {len(data)} bytes; the loader accepts '
+                         f'1..{PATCH_WRITE_LIMIT} per entry')
+    return data
 
 
 def compile_patches(xml, names, app_version, segments):
@@ -214,7 +221,7 @@ def compile_patches(xml, names, app_version, segments):
     for name in names:
         for line in found[name].iter('Line'):
             offset=int(line.get('Address') or '',0)-EBOOT_BASE
-            data=encode(line)
+            data=encode(line,name)
             if not any(start<=offset and offset+len(data)<=end for start,end in segments):
                 raise ValueError(f'{name}: address {line.get("Address")} is outside the eboot')
             writes.append((offset,data))
@@ -234,8 +241,12 @@ def external_patches(directory, app_version='01.09', exclude=Path(__file__).reso
     for path in sorted(directory.rglob('*.xml')) if directory.is_dir() else []:
         if path.resolve()==Path(exclude).resolve(): continue  # the built-in file (patches/ in a checkout)
         try:
+            if b'<!entity' in path.read_bytes().lower():
+                # Same guard as compile_patches: xml.etree expands internal general entities,
+                # so a hostile file could hang the launcher in an entity-expansion bomb.
+                raise ValueError('declares XML entities; refusing to parse it')
             root=ET.parse(path).getroot()
-        except ET.ParseError as error:
+        except (ET.ParseError,OSError,ValueError) as error:
             print(f'Patches: {path.relative_to(directory)}: {error}',file=sys.stderr)
             continue
         ids={e.text.strip() for e in root.iter('ID') if e.text}
@@ -253,7 +264,9 @@ def external_selection(found, config):
     if config and Path(config).is_file():
         try:
             settings=json.loads(Path(config).read_text())
-        except (json.JSONDecodeError,UnicodeDecodeError,OSError) as error:
+            if not isinstance(settings,dict):
+                raise ValueError(f'root is a {type(settings).__name__}, not an object')
+        except (json.JSONDecodeError,UnicodeDecodeError,OSError,ValueError) as error:
             print(f'Patches: ignoring broken {config}: {error}',file=sys.stderr)
     enabled,disabled=set(settings.get('enabled',[])),set(settings.get('disabled',[]))
     return [(key,path,meta) for key,path,meta in found
@@ -275,7 +288,7 @@ def compile_external(selected, segments, built_writes=()):
             conflict=None
             for line in meta.iter('Line'):
                 offset=int(line.get('Address') or '',0)-EBOOT_BASE
-                data=encode(line)
+                data=encode(line,key)
                 if not any(start<=offset and offset+len(data)<=end for start,end in segments):
                     raise ValueError(f'address {line.get("Address")} is outside the eboot')
                 for i,b in enumerate(data):

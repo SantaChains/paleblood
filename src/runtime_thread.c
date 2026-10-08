@@ -127,15 +127,8 @@ void runtime_thread_attach_main(void) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
 }
-static GuestThread *find_thread(void *handle) {
-    GuestThread *found=NULL;
-    host_lock(&lock);
-    for (GuestThread *t=threads;t;t=t->next) if (t==handle) { found=t; break; }
-    host_unlock(&lock);
-    return found;
-}
 /* Lockless membership probe for sections that already hold the lock: records are freed
- * on reap, so the membership test and the state check must share one lock section. */
+ * on reap, so every handle dereference must share one lock section with the test. */
 static int thread_listed(const GuestThread *t) {
     for (const GuestThread *it=threads;it;it=it->next) if (it==t) return 1;
     return 0;
@@ -174,11 +167,18 @@ static ABI int32_t attr_destroy(ThreadAttr **slot) {
 static ABI int32_t attr_get(void *thread,ThreadAttr **out) {
     ThreadAttr *a=find_attr(out);
     if (!a || !thread) return ERR(22);
-    GuestThread *t=find_thread(thread);
-    if (!t) return ERR(3);
+    /* The thread record is freed by join's reap: copy its fields inside the lock, then
+     * write the attr outside it (find_attr validated `a`, but keep its list linkage). */
+    ThreadAttr copy;
+    int detached;
+    host_lock(&lock);
+    if (!thread_listed(thread)) { host_unlock(&lock); return ERR(3); }
+    copy=((const GuestThread *)thread)->attr;
+    detached=((const GuestThread *)thread)->detached;
+    host_unlock(&lock);
     ThreadAttr *next=a->next;
-    *a=t->attr; a->magic=ATTR_MAGIC; a->next=next;
-    a->detached=t->detached;
+    *a=copy; a->magic=ATTR_MAGIC; a->next=next;
+    a->detached=detached;
     return 0;
 }
 static ABI int32_t attr_set_stack(ThreadAttr **slot,uint64_t size) {
@@ -319,7 +319,7 @@ static ABI int32_t thread_join(GuestThread *t,void **result) {
     int e=host_thread_join(t->host);
     if (e) { fprintf(stderr,"STOP: host thread join failed: %d\n",e); exit(21); }
     if (result) *result=t->result;
-    /* Reap: unlink first so any later handle dereference through find_thread returns
+    /* Reap: unlink first so any later handle dereference through thread_listed returns
      * ESRCH, then release the TLS block and the record itself (joined once, unreferenced). */
     host_lock(&lock);
     for (GuestThread **p=&threads;*p;p=&(*p)->next) if (*p==t) { *p=t->next; break; }
@@ -357,28 +357,48 @@ static ABI __attribute__((noreturn)) void thread_exit(void *value) {
 }
 static ABI int32_t thread_yield(void) { host_yield(); return 0; }
 static ABI int32_t thread_get_prio(GuestThread *t,int *prio) {
-    if (!find_thread(t)) return ERR(3);
+    int value;
+    host_lock(&lock);
+    if (!thread_listed(t)) { host_unlock(&lock); return ERR(3); }
+    value=t->attr.prio;
+    host_unlock(&lock);
     if (!prio) return ERR(22);
-    *prio=t->attr.prio; return 0;
+    *prio=value; return 0;
 }
 static ABI int32_t thread_set_prio(GuestThread *t,int prio) {
-    if (!find_thread(t)) return ERR(3);
-    t->attr.prio=prio; return 0;
+    host_lock(&lock);
+    if (!thread_listed(t)) { host_unlock(&lock); return ERR(3); }
+    t->attr.prio=prio;
+    host_unlock(&lock);
+    return 0;
 }
 static ABI int32_t thread_set_affinity(GuestThread *t,uint64_t mask) {
-    if (!find_thread(t)) return ERR(3);
-    t->attr.affinity=mask; return 0;
+    host_lock(&lock);
+    if (!thread_listed(t)) { host_unlock(&lock); return ERR(3); }
+    t->attr.affinity=mask;
+    host_unlock(&lock);
+    return 0;
 }
 static ABI int32_t thread_get_affinity(GuestThread *t,uint64_t *mask) {
-    if (!find_thread(t)) return ERR(3);
+    uint64_t value;
+    host_lock(&lock);
+    if (!thread_listed(t)) { host_unlock(&lock); return ERR(3); }
+    value=t->attr.affinity;
+    host_unlock(&lock);
     if (!mask) return ERR(22);
-    *mask=t->attr.affinity; return 0;
+    *mask=value; return 0;
 }
 static ABI int32_t thread_rename(GuestThread *t,const char *name) {
-    if (!find_thread(t)) return ERR(3);
-    if (!name) return ERR(22);
+    /* The record may be reaped concurrently: write the field under the lock, run the
+     * host rename API outside it from a local copy. */
+    char copy[sizeof t->name];
+    host_lock(&lock);
+    if (!thread_listed(t)) { host_unlock(&lock); return ERR(3); }
+    if (!name) { host_unlock(&lock); return ERR(22); }
     snprintf(t->name,sizeof(t->name),"%s",name);
-    if (t==current) set_host_name(t->name);
+    memcpy(copy,t->name,sizeof copy);
+    host_unlock(&lock);
+    if (t==current) set_host_name(copy);
     return 0;
 }
 static ABI int32_t thread_equal(GuestThread *a,GuestThread *b) { return a==b; }

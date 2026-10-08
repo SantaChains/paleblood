@@ -154,39 +154,48 @@ static ABI int32_t mutex_init(GuestMutex **out, GuestAttr **attr, const char *na
     *out = mutex; ++created; return 0;
 }
 static HostMutex static_init = HOST_MUTEX_INIT;
-/* Statically initialized handles (0/1) are created once, even under contention. */
-static int32_t ensure_mutex(GuestMutex **mutex) {
+/* Statically initialized handles (0/1) are created once, even under contention. On success
+ * *out receives a snapshot of the current object: every operation below must dereference
+ * the snapshot instead of re-reading the handle, or a concurrent destroy (which clears the
+ * handle, see mutex_destroy) could turn the dereference into &NULL->native. Safe because
+ * destroyed objects are never freed. */
+static int32_t ensure_mutex(GuestMutex **mutex, GuestMutex **out) {
     if (!mutex) return orbis_error(EINVAL);
     uintptr_t value = __atomic_load_n((uintptr_t *)mutex, __ATOMIC_ACQUIRE);
-    if (value >= 2) return 0;
+    if (value >= 2) { *out = (GuestMutex *)value; return 0; }
     host_lock(&static_init);
     int32_t e = 0;
-    if ((uintptr_t)*mutex < 2) {
+    value = (uintptr_t)*mutex;
+    if (value < 2) {
         GuestMutex *created_mutex = NULL;
         e = mutex_init(&created_mutex, NULL, NULL);
-        if (!e) __atomic_store_n(mutex, created_mutex, __ATOMIC_RELEASE);
+        if (!e) { __atomic_store_n(mutex, created_mutex, __ATOMIC_RELEASE); value = (uintptr_t)created_mutex; }
     }
     host_unlock(&static_init);
+    if (!e) *out = (GuestMutex *)value;
     return e;
 }
 static ABI int32_t mutex_lock(GuestMutex **mutex) {
-    int32_t e = ensure_mutex(mutex);
+    GuestMutex *m;
+    int32_t e = ensure_mutex(mutex, &m);
     if (e) return e;
-    e = orbis_error(native_lock(&(*mutex)->native));
+    e = orbis_error(native_lock(&m->native));
     if (!e) ++locks;
     return e;
 }
 static ABI int32_t mutex_trylock(GuestMutex **mutex) {
-    int32_t e = ensure_mutex(mutex);
+    GuestMutex *m;
+    int32_t e = ensure_mutex(mutex, &m);
     if (e) return e;
-    e = orbis_error(native_trylock(&(*mutex)->native));
+    e = orbis_error(native_trylock(&m->native));
     if (!e) ++locks;
     return e;
 }
 static ABI int32_t mutex_unlock(GuestMutex **mutex) {
     if (!mutex) return orbis_error(EINVAL);
-    if ((uintptr_t)*mutex < 2) return orbis_error(EPERM);
-    int32_t e = orbis_error(native_unlock(&(*mutex)->native));
+    GuestMutex *m = (GuestMutex *)__atomic_load_n((uintptr_t *)mutex, __ATOMIC_ACQUIRE);
+    if ((uintptr_t)m < 2) return orbis_error(EPERM);
+    int32_t e = orbis_error(native_unlock(&m->native));
     if (!e) ++unlocks;
     return e;
 }
@@ -203,9 +212,10 @@ static ABI int32_t mutex_destroy(GuestMutex **mutex) {
 static uint64_t deadline_after(uint64_t usec) { return host_realtime_ns() + usec * 1000; }
 static int32_t timed_error(int e) { return e == ETIMEDOUT ? (int32_t)UINT32_C(0x8002003c) : orbis_error(e); }
 static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
-    int32_t e = ensure_mutex(mutex);
+    GuestMutex *m;
+    int32_t e = ensure_mutex(mutex, &m);
     if (e) return e;
-    e = timed_error(native_timedlock(&(*mutex)->native, deadline_after(usec)));
+    e = timed_error(native_timedlock(&m->native, deadline_after(usec)));
     if (!e) ++locks;
     return e;
 }
@@ -222,17 +232,20 @@ static ABI int32_t cond_init(GuestCond **out, void **attr, const char *name) {
     if (e) { free(c); return orbis_error(e); }
     *out = c; ++conds; return 0;
 }
-static int32_t ensure_cond(GuestCond **cond) {
+static int32_t ensure_cond(GuestCond **cond, GuestCond **out) {
     if (!cond) return orbis_error(EINVAL);
-    if (__atomic_load_n((uintptr_t *)cond, __ATOMIC_ACQUIRE) >= 2) return 0;
+    uintptr_t value = __atomic_load_n((uintptr_t *)cond, __ATOMIC_ACQUIRE);
+    if (value >= 2) { *out = (GuestCond *)value; return 0; }
     host_lock(&static_init);
     int32_t e = 0;
-    if ((uintptr_t)*cond < 2) {
+    value = (uintptr_t)*cond;
+    if (value < 2) {
         GuestCond *c = NULL;
         e = cond_init(&c, NULL, NULL);
-        if (!e) __atomic_store_n(cond, c, __ATOMIC_RELEASE);
+        if (!e) { __atomic_store_n(cond, c, __ATOMIC_RELEASE); value = (uintptr_t)c; }
     }
     host_unlock(&static_init);
+    if (!e) *out = (GuestCond *)value;
     return e;
 }
 static ABI int32_t cond_destroy(GuestCond **cond) {
@@ -241,31 +254,40 @@ static ABI int32_t cond_destroy(GuestCond **cond) {
     return 0;
 }
 static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
-    int32_t e = ensure_cond(cond);
+    GuestCond *c; GuestMutex *m;
+    int32_t e = ensure_cond(cond, &c);
     if (e) return e;
-    if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
+    /* Snapshot both handles: cond and mutex may be destroyed concurrently (see ensure_mutex). */
+    if (!mutex) return orbis_error(EINVAL);
+    m = (GuestMutex *)__atomic_load_n((uintptr_t *)mutex, __ATOMIC_ACQUIRE);
+    if ((uintptr_t)m < 3) return orbis_error(EINVAL);
     ++waits;
-    return orbis_error(native_cond_wait(&(*cond)->native, &(*mutex)->native, 0));
+    return orbis_error(native_cond_wait(&c->native, &m->native, 0));
 }
 static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, uint64_t deadline) {
-    int32_t e = ensure_cond(cond);
+    GuestCond *c; GuestMutex *m;
+    int32_t e = ensure_cond(cond, &c);
     if (e) return e;
-    if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
+    if (!mutex) return orbis_error(EINVAL);
+    m = (GuestMutex *)__atomic_load_n((uintptr_t *)mutex, __ATOMIC_ACQUIRE);
+    if ((uintptr_t)m < 3) return orbis_error(EINVAL);
     ++waits;
-    return timed_error(native_cond_wait(&(*cond)->native, &(*mutex)->native, deadline ? deadline : 1));
+    return timed_error(native_cond_wait(&c->native, &m->native, deadline ? deadline : 1));
 }
 static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t usec) {
     return cond_wait_until(cond, mutex, deadline_after(usec));
 }
 static ABI int32_t cond_signal(GuestCond **cond) {
-    int32_t e = ensure_cond(cond);
+    GuestCond *c;
+    int32_t e = ensure_cond(cond, &c);
     if (e) return e;
-    ++wakeups; return orbis_error(native_cond_signal(&(*cond)->native));
+    ++wakeups; return orbis_error(native_cond_signal(&c->native));
 }
 static ABI int32_t cond_broadcast(GuestCond **cond) {
-    int32_t e = ensure_cond(cond);
+    GuestCond *c;
+    int32_t e = ensure_cond(cond, &c);
     if (e) return e;
-    ++wakeups; return orbis_error(native_cond_broadcast(&(*cond)->native));
+    ++wakeups; return orbis_error(native_cond_broadcast(&c->native));
 }
 /* PS4 struct timespec is {int64 sec, int64 nsec}, identical to Linux x86-64. */
 typedef struct { int64_t sec, nsec; } GuestTimespec;

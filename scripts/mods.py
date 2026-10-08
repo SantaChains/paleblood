@@ -75,6 +75,11 @@ def selected(root, config):
     if not config or not Path(config).is_file():
         return available
     settings = json.loads(Path(config).read_text())
+    if not isinstance(settings, dict):
+        # A broken config must not take the launch down: fall back to every discovered mod.
+        print(f'Mods: ignoring broken {config}: root is a {type(settings).__name__}, not an object',
+              file=sys.stderr)
+        return available
     disabled_names = settings.get('disabled', [])
     if not isinstance(disabled_names, list) or not all(isinstance(n, str) for n in disabled_names):
         raise ValueError('Disabled mods must be a list of folder names')

@@ -33,7 +33,13 @@ if exist "out\game_dir.txt" goto have-game
 if defined BB_GAME_DIR goto have-game
 echo %* | findstr /C:"--game-dir" >nul && goto have-game
 set /p "GAME_DIR=First run: enter the path to your Bloodborne 1.09 dump (the folder containing eboot.bin): "
-if not defined GAME_DIR exit /b 1
+if not defined GAME_DIR (
+    echo No path entered.
+    pause
+    exit /b 1
+)
+rem A path pasted with quotes stays one token below, and %%~G strips the wrapping pair.
+for %%G in ("%GAME_DIR%") do set "GAME_DIR=%%~G"
 if not exist "%GAME_DIR%\eboot.bin" (
     echo No eboot.bin in "%GAME_DIR%" - that folder is not a game dump.
     pause

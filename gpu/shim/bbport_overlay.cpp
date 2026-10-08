@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -172,8 +173,8 @@ void SetOpen(bool value) {
         }).detach();
         std::thread([] { BbSettings::Save(); }).detach();
         // The custom-look snapshot may have changed since the last save (every manual edit
-        // re-captures it). Menu teardown finished above, so nothing renders concurrently and
-        // the vector reads in SaveUserStyles are uncontended.
+        // re-captures it). SaveUserStyles copies the containers under g_user_styles_mutex,
+        // so the detached writer cannot race the menu's edits.
         if (g_custom_look_valid) {
             std::thread([] { SaveUserStyles(); }).detach();
         }
@@ -472,6 +473,9 @@ char save_style_name[64] = "";
 /// Persisted in user-presets.json as "custom" so it survives restarts.
 StyleSlot g_custom_look{};
 bool g_custom_look_valid = false;
+/// Guards g_user_styles/g_custom_look: the close-time save runs on a detached thread while
+/// the menu thread may still edit the containers (reopen, save popup, delete, re-capture).
+static std::mutex g_user_styles_mutex;
 
 /// user-presets.json next to bbport.ini (the same data-directory convention as
 /// cheats/state.txt and mods.json).
@@ -631,6 +635,7 @@ void LoadUserStyles() {
             else if (key == "mono") slot.mono = value == "true" || value == "1";
         }
         if (!slot.name.empty() && int(g_user_styles.size()) < kMaxUserStyles) {
+            std::scoped_lock lock{g_user_styles_mutex};
             g_user_styles.push_back(std::move(slot));
         }
     }
@@ -688,21 +693,39 @@ void LoadUserStyles() {
         else if (key == "sharpen") snap.sharpen = to_int(value, 0);
         else if (key == "range") snap.range = to_int(value, 12);
     }
-    g_custom_look = std::move(snap);
-    g_custom_look_valid = true;
+    {
+        std::scoped_lock lock{g_user_styles_mutex};
+        g_custom_look = std::move(snap);
+        g_custom_look_valid = true;
+    }
 }
 
 void SaveUserStyles() {
+    // Snapshot under the lock, write outside it: this runs detached (menu close) and must
+    // neither race the menu's edits nor hold the lock across disk I/O.
+    std::vector<StyleSlot> styles;
+    StyleSlot custom{};
+    bool custom_valid = false;
+    {
+        std::scoped_lock lock{g_user_styles_mutex};
+        styles = g_user_styles;
+        custom = g_custom_look;
+        custom_valid = g_custom_look_valid;
+    }
     const std::string path = UserStylePath();
-    const std::string tmp = path + ".tmp"; // write-then-rename: a kill mid-write keeps the old file
+    // The thread id keeps concurrent saves from clobbering each other's temporary; the
+    // rename target below is still the one shared path.
+    std::ostringstream tmp_name;
+    tmp_name << path << ".tmp" << std::this_thread::get_id();
+    const std::string tmp = tmp_name.str();
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
     if (!f) {
         std::printf("Overlay: cannot write %s\n", tmp.c_str());
         return;
     }
     std::fprintf(f, "{\n  \"presets\": [\n");
-    for (size_t i = 0; i < g_user_styles.size(); ++i) {
-        const auto& p = g_user_styles[i];
+    for (size_t i = 0; i < styles.size(); ++i) {
+        const auto& p = styles[i];
         // The name comes from a free-text field: escape what JSON treats as structure, or a
         // quote or backslash in it would corrupt the file (and LoadUserStyles would then drop
         // every slot after the broken one).
@@ -724,25 +747,25 @@ void SaveUserStyles() {
                      "\"grain\": %d, \"mono\": %s}%s\n",
                      esc.c_str(), p.shadow, p.contrast, p.sat, p.vib, p.lr, p.lg, p.lb, p.gr,
                      p.gg, p.gb, p.sr, p.sg, p.sb, p.lbk, p.lwh, p.grain, p.mono ? "true" : "false",
-                     i + 1 == g_user_styles.size() ? "" : ",");
+                     i + 1 == styles.size() ? "" : ",");
     }
     std::fprintf(f, "  ]\n");
     // The custom snapshot rides along when one exists, so clicking 自定义 restores the
     // user's own look even after a restart.
-    if (g_custom_look_valid) {
+    if (custom_valid) {
         std::fprintf(f,
                      "  \"custom\": {\"shadow\": %d, \"contrast\": %d, \"sat\": %d, \"vib\": %d, "
                      "\"lr\": %d, \"lg\": %d, \"lb\": %d, \"gr\": %d, \"gg\": %d, \"gb\": %d, "
                      "\"sr\": %d, \"sg\": %d, \"sb\": %d, \"lbk\": %d, \"lwh\": %d, "
                      "\"grain\": %d, \"mono\": %s, \"split\": %s, "
                      "\"deband\": %d, \"defog\": %d, \"sharpen\": %d, \"range\": %d}\n",
-                     g_custom_look.shadow, g_custom_look.contrast, g_custom_look.sat,
-                     g_custom_look.vib, g_custom_look.lr, g_custom_look.lg, g_custom_look.lb,
-                     g_custom_look.gr, g_custom_look.gg, g_custom_look.gb, g_custom_look.sr,
-                     g_custom_look.sg, g_custom_look.sb, g_custom_look.lbk, g_custom_look.lwh,
-                     g_custom_look.grain, g_custom_look.mono ? "true" : "false",
-                     g_custom_look.split ? "true" : "false", g_custom_look.deband,
-                     g_custom_look.defog, g_custom_look.sharpen, g_custom_look.range);
+                     custom.shadow, custom.contrast, custom.sat,
+                     custom.vib, custom.lr, custom.lg, custom.lb,
+                     custom.gr, custom.gg, custom.gb, custom.sr,
+                     custom.sg, custom.sb, custom.lbk, custom.lwh,
+                     custom.grain, custom.mono ? "true" : "false",
+                     custom.split ? "true" : "false", custom.deband,
+                     custom.defog, custom.sharpen, custom.range);
     }
     std::fprintf(f, "}\n");
     std::fclose(f);
@@ -765,11 +788,14 @@ void SaveUserStyles() {
 }
 
 void DeleteUserStyle(int index) {
-    if (index < 0 || index >= int(g_user_styles.size())) {
-        return;
+    {
+        std::scoped_lock lock{g_user_styles_mutex};
+        if (index < 0 || index >= int(g_user_styles.size())) {
+            return;
+        }
+        g_user_styles.erase(g_user_styles.begin() + index);
+        g_style_list_dirty = true;
     }
-    g_user_styles.erase(g_user_styles.begin() + index);
-    g_style_list_dirty = true;
     SaveUserStyles();
 }
 
@@ -777,15 +803,18 @@ void DeleteUserStyle(int index) {
 /// landed). This is what the 自定义 entry later restores: the look as the user last left it
 /// by hand.
 void CaptureCustomLook(const BbSettings::Values& s) {
-    g_custom_look = StyleSlot{
-        "自定义",          s.post_shadow,     s.post_contrast,   s.post_saturation,
-        s.post_vibrance,   s.post_lift_r,     s.post_lift_g,     s.post_lift_b,
-        s.post_gamma_r,    s.post_gamma_g,    s.post_gamma_b,    s.post_gain_r,
-        s.post_gain_g,     s.post_gain_b,     s.post_levels_black, s.post_levels_white,
-        s.post_grain,      s.post_mono,       false,
-        s.post_deband,     s.post_defog,      s.post_sharpen,    s.post_range,
-        s.post_split};
-    g_custom_look_valid = true;
+    {
+        std::scoped_lock lock{g_user_styles_mutex};
+        g_custom_look = StyleSlot{
+            "自定义",          s.post_shadow,     s.post_contrast,   s.post_saturation,
+            s.post_vibrance,   s.post_lift_r,     s.post_lift_g,     s.post_lift_b,
+            s.post_gamma_r,    s.post_gamma_g,    s.post_gamma_b,    s.post_gain_r,
+            s.post_gain_g,     s.post_gain_b,     s.post_levels_black, s.post_levels_white,
+            s.post_grain,      s.post_mono,       false,
+            s.post_deband,     s.post_defog,      s.post_sharpen,    s.post_range,
+            s.post_split};
+        g_custom_look_valid = true;
+    }
 }
 
 /// Restores the snapshot. The atomics' current values are the widget source, so each Store
@@ -847,17 +876,20 @@ void DrawSaveStylePopup() {
     }
     ImGui::BeginDisabled(empty || full);
     if (ImGui::Button("保存", ImVec2(120.0f, 0.0f))) {
-        g_user_styles.push_back(MakeSlot(name, StylePreset{
-                                               name.c_str(),
-                                               s.post_shadow,    s.post_contrast,
-                                               s.post_saturation, s.post_vibrance,
-                                               s.post_lift_r,    s.post_lift_g,
-                                               s.post_lift_b,    s.post_gamma_r,
-                                               s.post_gamma_g,   s.post_gamma_b,
-                                               s.post_gain_r,    s.post_gain_g,
-                                               s.post_gain_b,    s.post_levels_black,
-                                               s.post_levels_white, s.post_grain,
-                                               s.post_mono, false}));
+        {
+            std::scoped_lock lock{g_user_styles_mutex};
+            g_user_styles.push_back(MakeSlot(name, StylePreset{
+                                                   name.c_str(),
+                                                   s.post_shadow,    s.post_contrast,
+                                                   s.post_saturation, s.post_vibrance,
+                                                   s.post_lift_r,    s.post_lift_g,
+                                                   s.post_lift_b,    s.post_gamma_r,
+                                                   s.post_gamma_g,   s.post_gamma_b,
+                                                   s.post_gain_r,    s.post_gain_g,
+                                                   s.post_gain_b,    s.post_levels_black,
+                                                   s.post_levels_white, s.post_grain,
+                                                   s.post_mono, false}));
+        }
         SaveUserStyles();
         g_style_list_dirty = true;
         save_style_popup = false;

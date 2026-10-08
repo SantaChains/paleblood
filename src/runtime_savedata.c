@@ -12,6 +12,7 @@
 #include <time.h>
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -116,6 +117,11 @@ static int valid_name(const char *name, size_t max) {
     for (size_t i=0;i<n;++i) if (name[i]=='/' || name[i]=='\\' || (name[i]=='.' && (i==0 || name[i-1]=='.'))) return 0;
     return 1;
 }
+/* Guest name fields are fixed-width and may fill without a NUL: copy bounded, terminate. */
+static void bounded_copy(char *out, size_t width, const char *field) {
+    memcpy(out,field,width);
+    out[width]=0;
+}
 static void write_param(const char *meta, const Param *p) {
     char path[700]; snprintf(path,sizeof(path),"%s/param.bin",meta);
     FILE *f=fopen(path,"wb");
@@ -175,22 +181,32 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
 }
 static ABI int32_t save_mount(const Mount1 *m, MountResult *result) {
     if (!m) return ERR_PARAMETER;
-    return mount(m->user,m->title ? m->title->data : NULL,m->dir,m->mode,result);
+    char title[1+sizeof m->title->data]; /* TitleId.data may fill without a NUL */
+    if (m->title) bounded_copy(title,sizeof m->title->data,m->title->data);
+    return mount(m->user,m->title ? title : NULL,m->dir,m->mode,result);
 }
 static ABI int32_t save_mount2(const Mount2 *m, MountResult *result) {
     if (!m) return ERR_PARAMETER;
     return mount(m->user,NULL,m->dir,m->mode,result);
 }
 static int slot_of(const MountPoint *point) {
-    if (!point || strncmp(point->data,"/savedata",9)) return -1;
-    int slot=atoi(point->data+9);
+    if (!point) return -1;
+    char text[1+sizeof point->data]; /* MountPoint.data may fill without a NUL */
+    bounded_copy(text,sizeof point->data,point->data);
+    if (strncmp(text,"/savedata",9)) return -1;
+    int slot=atoi(text+9);
     return slot>=0 && slot<SLOTS && slots[slot].used ? slot : -1;
 }
 static ABI int32_t save_umount(const MountPoint *point) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     host_lock(&lock);
     int slot=slot_of(point);
-    if (slot>=0) { runtime_file_unmount(point->data); slots[slot].used=0; }
+    if (slot>=0) {
+        char text[1+sizeof point->data];
+        bounded_copy(text,sizeof point->data,point->data);
+        runtime_file_unmount(text);
+        slots[slot].used=0;
+    }
     host_unlock(&lock);
     return slot>=0 ? 0 : ERR_NOT_FOUND;
 }
@@ -203,9 +219,12 @@ static ABI int32_t save_set_param(const MountPoint *point, uint32_t type, const 
     Param p; read_param(slots[slot].meta,&p);
     switch (type) {
     case 0: if (size<sizeof(Param)) goto bad; memcpy(&p,buffer,sizeof(p)); break;     /* ALL */
-    case 1: snprintf(p.title,sizeof(p.title),"%.*s",(int)size,(const char *)buffer); break;
-    case 2: snprintf(p.subtitle,sizeof(p.subtitle),"%.*s",(int)size,(const char *)buffer); break;
-    case 3: snprintf(p.detail,sizeof(p.detail),"%.*s",(int)size,(const char *)buffer); break;
+    case 1: if (!size || size>(uint64_t)INT_MAX) goto bad;
+            snprintf(p.title,sizeof(p.title),"%.*s",(int)size,(const char *)buffer); break;
+    case 2: if (!size || size>(uint64_t)INT_MAX) goto bad;
+            snprintf(p.subtitle,sizeof(p.subtitle),"%.*s",(int)size,(const char *)buffer); break;
+    case 3: if (!size || size>(uint64_t)INT_MAX) goto bad;
+            snprintf(p.detail,sizeof(p.detail),"%.*s",(int)size,(const char *)buffer); break;
     case 4: if (size<4) goto bad; memcpy(&p.user_param,buffer,4); break;
     default: goto bad;
     }
@@ -234,8 +253,10 @@ static ABI int32_t save_icon(const MountPoint *point, const Icon *icon) {
 static ABI int32_t save_delete(const Delete *d) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (!d || !d->dir || !valid_name(d->dir->data,sizeof(d->dir->data))) return ERR_PARAMETER;
+    char title[1+sizeof d->title->data]; /* TitleId.data may fill without a NUL */
+    if (d->title) bounded_copy(title,sizeof d->title->data,d->title->data);
     char base[600], host[640], meta[680];
-    root(d->user,d->title ? d->title->data : NULL,base,sizeof(base));
+    root(d->user,d->title ? title : NULL,base,sizeof(base));
     snprintf(host,sizeof(host),"%s/%s",base,d->dir->data);
     snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,d->dir->data);
     struct stat st;
@@ -265,14 +286,18 @@ static int compare(const void *a, const void *b) {
 static ABI int32_t save_search(const SearchCond *cond, SearchResult *result) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (!cond || !result) return ERR_PARAMETER;
+    char title[1+sizeof cond->title->data]; /* TitleId.data may fill without a NUL */
+    if (cond->title) bounded_copy(title,sizeof cond->title->data,cond->title->data);
     char base[600];
-    root(cond->user,cond->title ? cond->title->data : NULL,base,sizeof(base));
+    root(cond->user,cond->title ? title : NULL,base,sizeof(base));
+    char pattern[1+sizeof cond->dir->data]; /* DirName.data may fill without a NUL */
+    if (cond->dir) bounded_copy(pattern,sizeof cond->dir->data,cond->dir->data); else pattern[0]=0;
     Entry *entries=NULL; size_t count=0, capacity=0;
     DIR *d=opendir(base);
     for (struct dirent *e; d && (e=readdir(d));) {
         size_t n=strlen(e->d_name);
         if (e->d_name[0]=='.' || n>=32 || (n>8 && !strcmp(e->d_name+n-8,".sce_sys"))) continue;
-        if (cond->dir && cond->dir->data[0] && !like(e->d_name,cond->dir->data)) continue;
+        if (cond->dir && pattern[0] && !like(e->d_name,pattern)) continue;
         if (count==capacity) {
             capacity=capacity ? capacity*2 : 16;
             Entry *grown=realloc(entries,capacity*sizeof(*entries));

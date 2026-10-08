@@ -32,13 +32,29 @@ IMAGE_OUTPUTS = ('boot-linked.bin', 'content.bin', 'eboot.elf')
 
 
 def msys_root():
-    return Path(os.environ.get('BB_MSYS2', r'C:\msys64'))
+    """BB_MSYS2 from the environment, else from the user's registry environment (a parent
+    process started before BB_MSYS2 was set, e.g. an IDE, carries a stale one)."""
+    if os.environ.get('BB_MSYS2'):
+        return Path(os.environ['BB_MSYS2'])
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment') as key:
+            value, _ = winreg.QueryValueEx(key, 'BB_MSYS2')
+            if value:
+                return Path(value)
+    except OSError:
+        pass
+    return Path(r'C:\msys64')
 
 
 def run(arguments, capture=False, check=True, env=None):
     result = subprocess.run([str(a) for a in arguments], cwd=ROOT, env=env,
                             stdout=subprocess.PIPE if capture else None, text=True)
     if check and result.returncode:
+        print(f'run_windows: step failed (exit {result.returncode}): '
+              f'{shlex.join(str(a) for a in arguments)}', file=sys.stderr)
+        if capture and result.stdout:
+            print(result.stdout[-2000:], file=sys.stderr)
         sys.exit(result.returncode)
     return result.stdout.strip() if capture else result.returncode
 
@@ -201,7 +217,14 @@ def main():
         live = os.environ.get('BB_LIVE_RES') or settings_value(config, 'live_resolution') or '0'
         if live == 'auto':
             caps = out / 'bb-gpu-capabilities.exe'
-            live = run([caps, '--live-resolution'], capture=True, check=False) or '0'
+            if caps.is_file():
+                # check=False, conservative: the probe's stdout is only a resolution hint, so
+                # a failing or odd run just falls back to the startup patch ("0") below.
+                live = run([caps, '--live-resolution'], capture=True, check=False) or '0'
+            else:
+                print('bb-gpu-capabilities.exe is not built: auto live-resolution detection is '
+                      'unavailable, using the startup patch instead')
+                live = '0'
         live = '1' if live == '1' else '0'
     if live == '1':
         print(f'Output {scaled_output}: live resolution changes (live_resolution=0: startup patch)')
