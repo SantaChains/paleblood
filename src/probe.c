@@ -855,6 +855,14 @@ int main(int argc, char **argv) {
 #endif
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
+    /* Cheat scratch area: the image head below the first segment (link metadata the
+     * running game never dereferences). Community cheat patches share data through
+     * absolute low patch-space addresses — this CUSA03023 set keeps an "attacker"
+     * slot at 0x4000, written by a master mov moffs64 and read by a mod's
+     * rip-relative cmp — so patch-space address T below the first segment maps 1:1
+     * to guest VA image+T and must be writable while the game runs. */
+    if (ns && segments[0].address)
+        protect(image, (size_t)segments[0].address, 2);
     int executable_entry = 0;
     for (uint64_t i = 0; i < ns; ++i) {
         protect(image + segments[i].address, round_page(segments[i].size), (unsigned)segments[i].flags);
