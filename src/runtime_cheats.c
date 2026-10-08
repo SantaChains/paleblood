@@ -52,10 +52,12 @@ typedef struct {
     int master_count, master_applied, master_wanted;
     CheatMod *mods;
     int mod_count;
+    uint64_t scratch_expected; /* bbport_scratch: the scratch base relocate_cheats.py assumed */
 } CheatFile;
 
 static CheatFile files[CHEAT_MAX_FILES];
 static int file_count;
+static uintptr_t cheat_scratch; /* guest VA of the scratch page, set by probe before boot */
 static char cheat_dir[1024] = "?";
 
 /* ---------------------------------------------------------------- JSON scanner (whitelist) */
@@ -336,6 +338,14 @@ static int parse_cheat(JParser *j, CheatFile *cf) {
             if (!j_string(j, cf->version, sizeof cf->version)) return 0;
         } else if (!strcmp(key, "process")) {
             if (!j_string(j, cf->process, sizeof cf->process)) return 0;
+        } else if (!strcmp(key, "bbport_scratch")) {
+            /* Written by scripts/relocate_cheats.py: the scratch base it assumed when
+             * rewriting low-address references. Verified against the live value after
+             * the parse so a stale out/ tree is rejected with a diagnosis instead of
+             * crashing on an absolute address that no longer points at the scratch. */
+            char v[32];
+            if (!j_string(j, v, sizeof v)) return 0;
+            cf->scratch_expected = strtoull(v, NULL, 0);
         } else if (!strcmp(key, "master")) {
             if (cf->master || !j_expect(j, '{')) return 0;
             for (;;) {
@@ -574,6 +584,10 @@ static int ends_with_json(const char *name) {
     size_t n = strlen(name);
     return n > 5 && !strcasecmp(name + n - 5, ".json");
 }
+void bbcheats_set_scratch(uintptr_t base) {
+    cheat_scratch = base;
+}
+
 void runtime_cheats_boot(const char *serial, const char *version) {
     const char *env = getenv("BB_CHEATS_DIR");
     if (env && *env) snprintf(cheat_dir, sizeof cheat_dir, "%s", env);
@@ -621,6 +635,14 @@ void runtime_cheats_boot(const char *serial, const char *version) {
         }
         if (cf.process[0] && strcmp(cf.process, "eboot.bin")) {
             printf("Cheats: %s: targets %s, not eboot.bin (skipped)\n", de->d_name, cf.process);
+            free_file(&cf);
+            continue;
+        }
+        if (cf.scratch_expected && cheat_scratch && cf.scratch_expected != cheat_scratch) {
+            printf("Cheats: %s: built for scratch %llx, this session is %llx — rerun "
+                   "scripts/relocate_cheats.py against the current boot image (skipped)\n",
+                   de->d_name, (unsigned long long)cf.scratch_expected,
+                   (unsigned long long)cheat_scratch);
             free_file(&cf);
             continue;
         }

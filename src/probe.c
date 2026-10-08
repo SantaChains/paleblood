@@ -101,6 +101,7 @@ static ABI void guest_exit(void) { puts("Runtime: process finalizer callback rea
  * faults in guest code (it has no unwind data, so frame-based handlers cannot see it). */
 static unsigned char *traps_base;
 static size_t traps_size, image_size;
+static uintptr_t scratch_base; /* cheat scratch page (image tail), see the protect pass */
 static Segment *cheat_segments; /* for runtime_cheat_write: the loader's segment table */
 static uint64_t cheat_ns;
 static void recover_jump(void) {
@@ -795,7 +796,8 @@ int main(int argc, char **argv) {
         }
     }
     cheat_segments = segments; cheat_ns = ns; /* runtime cheat writes validate against these */
-    image = allocate(round_page(size));
+    /* One trailing page becomes the cheat scratch area (see the protect pass below). */
+    image = allocate(round_page(size) + page_size);
 #ifdef _WIN32
     image_size = round_page(size);
 #endif
@@ -855,14 +857,18 @@ int main(int argc, char **argv) {
 #endif
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
-    /* Cheat scratch area: the image head below the first segment (link metadata the
-     * running game never dereferences). Community cheat patches share data through
-     * absolute low patch-space addresses — this CUSA03023 set keeps an "attacker"
-     * slot at 0x4000, written by a master mov moffs64 and read by a mod's
-     * rip-relative cmp — so patch-space address T below the first segment maps 1:1
-     * to guest VA image+T and must be writable while the game runs. */
-    if (ns && segments[0].address)
-        protect(image, (size_t)segments[0].address, 2);
+    /* Cheat scratch page: the image tail, one page past the linked metadata. Community
+     * cheat patches share data through absolute low patch-space addresses — the
+     * CUSA03023 set keeps an "attacker" slot at 0x4000, written by a master mov moffs64
+     * and read by a mod's rip-relative cmp — and scripts/relocate_cheats.py rewrites
+     * those references to scratch_base + T when it relocates the patch bytes. The base
+     * is image_base + round_page(image size), fully predictable from boot-linked.bin,
+     * and the engine cross-checks it against each json's bbport_scratch field. The
+     * image head is NOT usable for this: the first module is laid out from offset 0
+     * (entry at 0xa0), so low offsets sit inside the executable code segment. */
+    scratch_base = (uintptr_t)image + round_page(size);
+    protect(image + round_page(size), page_size, 2);
+    bbcheats_set_scratch(scratch_base);
     int executable_entry = 0;
     for (uint64_t i = 0; i < ns; ++i) {
         protect(image + segments[i].address, round_page(segments[i].size), (unsigned)segments[i].flags);

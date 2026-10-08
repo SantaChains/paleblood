@@ -241,6 +241,12 @@ def main():
          '--output-res', os.environ.get('BB_OUTPUT_RES', ''),
          '--patches-dir', os.environ.get('BB_PATCHES_DIR', data / 'patches'),
          '--patches-config', os.environ.get('BB_PATCHES_CONFIG', data / 'patches.json')])
+    # Cheat jsons keep their community form in the repo; the boot image layout decides
+    # the scratch page address, so the low-address references are relocated here, after
+    # boot-linked.bin exists, into out/cheats (the engine's BB_CHEATS_DIR below).
+    run([PYTHON, SCRIPTS / 'relocate_cheats.py', '--cheats-dir', ROOT / 'cheats',
+         '--boot-image', out / 'boot-linked.bin', '--out', out / 'cheats'])
+    os.environ['BB_CHEATS_DIR'] = str(out / 'cheats')
     os.environ.setdefault('BB_VBLANK_HZ', {'uncap': '0', '90': '90'}.get(fps, '60'))
     probe = ROOT / os.environ.get('BB_PROBE', out / 'bb-probe.exe')
     command = [probe, out / 'boot-linked.bin', '--content-profile', out / 'content.bin',

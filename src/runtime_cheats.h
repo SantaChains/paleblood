@@ -13,6 +13,15 @@ int runtime_cheat_write(uint64_t offset, const void *data, uint64_t size);
  * mods persisted as enabled. */
 void runtime_cheats_boot(const char *serial, const char *version);
 
+/* probe.c registers the guest VA of the cheat scratch page (the image tail) before boot.
+ * Community patch families share data through absolute low patch-space addresses (an
+ * "attacker" slot at 0x4000 in the CUSA03023 set); scripts/relocate_cheats.py rewrites
+ * those references to scratch_base + T and records the base it assumed in each json's
+ * bbport_scratch field, which the loader verifies against this value — a mismatch means
+ * the boot image changed without rerunning the relocation and the file is skipped with
+ * a loud message rather than crashing on a stale absolute address. */
+void bbcheats_set_scratch(uintptr_t base);
+
 /* Overlay bridge (the present thread is the only caller after boot). Index bounds are
  * bbcheats_file_count / bbcheats_mod_count; toggles return NULL on success or a static
  * error string (a literal, valid for the process lifetime). */
