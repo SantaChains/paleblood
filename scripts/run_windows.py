@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Windows counterpart of run.sh: prepare the game image, compile the patches and start
-out/bb-probe.exe. Same environment variables and bbport.ini settings as run.sh.
+"""Windows launcher: prepare the game image, compile the patches and start
+out/bb-probe.exe. Same environment variables and bbport.ini settings as run.bat.
 
     run.bat [--game-dir DIR] [bb-probe options...]
 
 The game folder: --game-dir, else BB_GAME_DIR, else the last one used (out/game_dir.txt), else
-../CUSA03173 (as run.sh). Building is separate (build.bat / build_windows.py, or run_windows.py
+../CUSA03173. Building is separate (build.bat / build_windows.py, or run_windows.py
 --build): the game starts directly, and the port is built only when bb-probe.exe is missing."""
 import functools
 import json
@@ -20,12 +20,14 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / 'scripts'
 PYTHON = sys.executable
 
-# The image chain (prepare/link_libc/link_modules/content_profile) reads only the game's
+# The image chain (prepare/link_modules/content_profile) reads only the game's
 # immutable binaries, the SKU and these scripts: its outputs are cached with a stamp of
 # those inputs and rebuilt when one of them changes (about 17 s once, ~0 on relaunch).
+# link_libc.py is not in the chain: boot-libc.bin feeds tests only, link_modules links
+# libc.prx itself.
 IMAGE_INPUTS = ('eboot.bin', 'sce_module/libc.prx', 'sce_module/libSceFios2.prx',
                 'sce_sys/param.sfo')
-IMAGE_SCRIPTS = ('prepare.py', 'link_libc.py', 'link_modules.py', 'content_profile.py')
+IMAGE_SCRIPTS = ('prepare.py', 'link_modules.py', 'content_profile.py')
 IMAGE_OUTPUTS = ('boot-linked.bin', 'content.bin', 'eboot.elf')
 
 
@@ -170,7 +172,7 @@ def main():
     if image_uptodate(original, out, sku):
         pass
     else:
-        for script, extra in (('prepare.py', []), ('link_libc.py', []), ('link_modules.py', []),
+        for script, extra in (('prepare.py', []), ('link_modules.py', []),
                               ('content_profile.py', ['--sku', sku])):
             run([PYTHON, SCRIPTS / script, original, '--out', out, *extra])
         (out / 'image-stamp.json').write_text(json.dumps(image_stamp(original, sku)),

@@ -21,6 +21,16 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // MoveFileExA: UCRT rename() fails with EEXIST on an existing target
+#endif
+
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
 #ifdef _WIN32
 // PE/COFF assemblers have no .hidden/.previous: the compiler embeds the file (#embed, a GCC
@@ -109,6 +119,10 @@ struct AtomicGcStats {
 };
 AtomicGcStats gc_stats;
 
+// Forward declarations for SetOpen(false)'s close-time flushes (definitions below).
+extern bool g_custom_look_valid;
+void SaveUserStyles();
+
 const char* UpscalerLabel(int upscaler) {
     switch (upscaler) {
     case BbSettings::UpscalerFsr3: return "FSR 3.1";
@@ -142,8 +156,10 @@ void SetOpen(bool value) {
         // released it — trying to take it here would deadlock against the present thread,
         // which is waiting for this thread to leave the critical section.
         //
-        // Losing the very last edit to a process that exits immediately after is not a
-        // regression: the ini is already flushed on IniSavingRate while the menu is open.
+        // The heartbeat in Render() is what makes edits durable during a session; this close-time
+        // flush stays as the final one, so the very last edit before the window goes away is
+        // written too. BbSettings::Save() takes its own lock, so overlapping with a heartbeat
+        // write is safe: they serialise, and the second one simply rewrites the same values.
         std::thread([] {
             std::scoped_lock lock{imgui_mutex};
             if (initialized) {
@@ -155,6 +171,12 @@ void SetOpen(bool value) {
             }
         }).detach();
         std::thread([] { BbSettings::Save(); }).detach();
+        // The custom-look snapshot may have changed since the last save (every manual edit
+        // re-captures it). Menu teardown finished above, so nothing renders concurrently and
+        // the vector reads in SaveUserStyles are uncontended.
+        if (g_custom_look_valid) {
+            std::thread([] { SaveUserStyles(); }).detach();
+        }
     }
 }
 
@@ -219,12 +241,28 @@ std::string UiIniPath() {
 
 std::string g_ui_ini_path;
 
-// Applies a widget's new value. Saving is unconditional on menu close (the close path hands
-// both files to a background thread), so there is no dirty flag to keep.
+// Set whenever a widget actually changes a value. The menu does not write the files on every
+// edit (a slider drag would rewrite the ini per frame); instead the flag makes Render() flush
+// at most once per second, so a crash, a kill or a power loss costs at most the last second of
+// edits instead of everything since the menu was opened.
+std::atomic<bool> settings_dirty{false};
+
+/// Set for the rest of the current menu page pass after any slider edit lands. The effects
+/// page uses it to snapshot the "自定义" look once per frame instead of once per widget.
+bool grade_edited_this_frame = false;
+
+/// When the last auto-save ran, so a burst of edits collapses into one write per second.
+std::chrono::steady_clock::time_point last_save{};
+
+// Applies a widget's new value and remembers that something changed. Every menu edit goes
+// through here or through an explicit Store(...) call, so this is the single place that has to
+// mark the settings dirty.
 template <typename T>
 void Store(std::atomic<T>& target, T value, bool changed) {
     if (changed) {
         target = value;
+        settings_dirty = true;
+        grade_edited_this_frame = true;
     }
 }
 
@@ -242,6 +280,54 @@ void Slider(const char* label, std::atomic<float>& value, float lo, float hi) {
     Store(value, v, changed);
 }
 
+/// Slider that knows its default: the label text turns to the accent colour while the value
+/// differs from it, and right-click offers "恢复默认" (the pattern ReShade and SpecialK use so
+/// a menu full of tweaks stays readable and every tweak stays reversible). The colour hint is
+/// deliberately not a label prefix — changing the label would change the widget ID and break
+/// an in-progress drag as the value crosses the default.
+void SliderWithDefault(const char* label, std::atomic<int>& target, int def, int lo, int hi,
+                       const char* fmt = "%d") {
+    const bool modified = target.load() != def;
+    if (modified) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.80f, 1.00f, 1.00f));
+    }
+    int v = target.load();
+    const bool changed = ImGui::SliderInt(label, &v, lo, hi, fmt);
+    if (modified) {
+        ImGui::PopStyleColor();
+    }
+    Store(target, v, changed);
+    if (ImGui::BeginPopupContextItem(label)) {
+        if (ImGui::MenuItem("恢复默认")) {
+            target = def;
+            settings_dirty = true;
+        }
+        ImGui::EndPopup();
+    }
+}
+
+/// Float overload: same interaction, "%.2f" by default like the plain slider above.
+void SliderWithDefault(const char* label, std::atomic<float>& target, float def, float lo,
+                       float hi, const char* fmt = "%.2f") {
+    const bool modified = target.load() != def;
+    if (modified) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.80f, 1.00f, 1.00f));
+    }
+    float v = target.load();
+    const bool changed = ImGui::SliderFloat(label, &v, lo, hi, fmt);
+    if (modified) {
+        ImGui::PopStyleColor();
+    }
+    Store(target, v, changed);
+    if (ImGui::BeginPopupContextItem(label)) {
+        if (ImGui::MenuItem("恢复默认")) {
+            target = def;
+            settings_dirty = true;
+        }
+        ImGui::EndPopup();
+    }
+}
+
 void Hint(const char* text) {
     ImGui::SameLine();
     ImGui::TextDisabled("(?)");
@@ -251,6 +337,32 @@ void Hint(const char* text) {
         ImGui::PopTextWrapPos();
         ImGui::EndTooltip();
     }
+}
+
+/// A CollapsingHeader whose open state survives restarts.
+///
+/// ImGui keeps these states in window->StateStorage, and its ini writer only has handlers for
+/// windows and tables (imgui.cpp:4472 registers WindowSettingsHandler_WriteAll,
+/// imgui_tables.cpp:4260 the table one); StateStorage appears nowhere near the save path, so
+/// every section reopened expanded on the next launch no matter what the user did. Rather than
+/// add a custom settings handler (internal API, and the state is per-section data we already
+/// own), the states live in bbport.ini as collapse_<label> (BbSettings::CollapseOpen) and the
+/// header is driven with SetNextItemOpen, which overrides ImGui's own stored value for this
+/// frame. A section only gets a key while it is not at its default, so an untouched menu
+/// writes no collapse_ lines at all.
+bool CollapsingHeader(const char* label, bool default_open = false) {
+    const bool remembered = BbSettings::CollapseOpen(label, default_open);
+    ImGui::SetNextItemOpen(remembered, ImGuiCond_Always);
+    const bool open = ImGui::CollapsingHeader(label, ImGuiTreeNodeFlags_None);
+    if (open == default_open) {
+        // Back at the default: drop the key rather than storing a redundant one.
+        if (BbSettings::ForgetCollapse(label)) {
+            settings_dirty = true;
+        }
+    } else if (BbSettings::SetCollapseOpen(label, open)) {
+        settings_dirty = true;
+    }
+    return open;
 }
 
 enum Page { PageGraphics, PageDisplay, PageEffects, PageCheats, PageAdvanced, PageCount };
@@ -269,21 +381,31 @@ struct StylePreset {
     int shadow, contrast, sat, vib;
     int lr, lg, lb, gr, gg, gb, sr, sg, sb, lbk, lwh, grain;
     bool mono;
+    /// "原味" only: also reset the correction sliders (deband, defog, sharpen, split, and
+    /// the deband radius) so selecting it truly shows the unmodified game picture. The other
+    /// presets leave corrections alone — they are tuned per scene, and a grade should not
+    /// undo them.
+    bool full_reset;
 };
 
 /// A preset with a heap-allocated name, so the five built-ins (string literals) and the
-/// user slots (read from the save dialog) share one type.
+/// user slots (read from the save dialog) share one type. The correction tail carries the
+/// "自定义" snapshot (the full filter state after the user's last manual edit); for built-in
+/// and saved slots it stays at the neutral values, because those do not own corrections.
 struct StyleSlot {
     std::string name;
     int shadow, contrast, sat, vib;
     int lr, lg, lb, gr, gg, gb, sr, sg, sb, lbk, lwh, grain;
     bool mono;
+    bool full_reset;
+    int deband = 0, defog = 0, sharpen = 0, range = 12;
+    bool split = false;
 };
 
 StyleSlot MakeSlot(std::string name, const StylePreset& p) {
     return StyleSlot{std::move(name), p.shadow, p.contrast, p.sat,   p.vib, p.lr, p.lg,
                      p.lb,      p.gr,           p.gg,      p.gb,   p.sr, p.sg, p.sb,
-                     p.lbk,     p.lwh,          p.grain,   p.mono};
+                     p.lbk,     p.lwh,          p.grain,   p.mono, p.full_reset};
 }
 
 // Defined below; UserStyles() calls this on first use so the file is read once, lazily,
@@ -296,17 +418,45 @@ bool StyleMatches(const StyleSlot& p, const BbSettings::Values& s);
 void ApplyStyle(const StyleSlot& p, BbSettings::Values& s);
 std::vector<StyleSlot>& StylePresets();
 const std::vector<StyleSlot>& UserStyles();
+// Built-in looks, themed on Yharnam (gothic Victorian, blood moon, candlelight, pale dream).
+// Amplitudes follow professional grading practice (sfx.thelazy.net ReShade database, DaVinci
+// split-toning guidance): per-channel lift/gain offsets stay within ~±0.10 of our ±0.20
+// CDL range — "if you can see the wheel move, it's too much" — the gamma wheel counter-rotates
+// against the gain wheel so midtones and faces stay put, and contrast sits in the 10..20
+// band the ReShade presets actually use. The old "胶片印象/冷蓝夜曲/暖褐怀旧/黑白惊悚" set
+// was replaced: those named moods but all graded in the same mild warm direction.
 constexpr StylePreset kBuiltinStyles[] = {
-    {"原味", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false},
-    {"胶片印象", 10, 5, -8, 0, 4, 4, 8, 0, 0, 0, 0, 0, 0, 6, 0, 30, false},
-    {"冷蓝夜曲", 6, 0, -15, 0, 0, 2, 10, -6, 0, 0, 2, 0, 6, 0, 0, 15, false},
-    {"暖褐怀旧", 8, 6, -25, 10, 6, 3, -2, 0, 0, 0, 5, 2, -4, 0, 0, 20, false},
-    {"黑白惊悚", 5, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 35, true},
+    {"原味", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, true},
+    // Blood moon: teal shadows, ember-orange highlights — the signature Bloodborne sky.
+    // Gamma (−4, +3, −2) counter-rotates so midtones stay neutral.
+    {"血月", 4, 12, 5, 18, -8, 0, 12, -4, 3, -2, 18, 4, -12, 4, 3, 12, false, false},
+    // Paleblood dream: a faded cold print — lifted blacks (10), lowered saturation, all
+    // channels slightly brightened through gamma, barely-there cyan shadows.
+    {"苍白之梦", 10, 6, -30, 0, 0, 2, 8, 6, 6, 4, 6, 2, 0, 0, 0, 18, false, false},
+    // Candlelit nocturne: deep crushed blacks (levels black 10), warm candle-orange
+    // highlights, a whisper of warm brown in the shadows.
+    {"烛光夜曲", 0, 18, 12, 8, 4, 2, -2, 2, 0, -4, 20, 10, -8, 10, 4, 15, false, false},
+    // Silver gelatin print: mono must be last in the chain (it washes all tinting), so this
+    // look is purely tonal — both black and white points pulled in, heavy grain.
+    {"银盐", 6, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 6, 28, true, false},
 };
 constexpr int kBuiltinStyleCount = int(sizeof(kBuiltinStyles) / sizeof(kBuiltinStyles[0]));
 /// First index of a user slot inside the combined list (StylePresets()).
 constexpr int StyleUserBase = kBuiltinStyleCount;
 constexpr int kMaxUserStyles = 32;
+
+/// One-line intent per built-in, shown as the combo entry's tooltip. Index-aligned with
+/// kBuiltinStyles; written for a player deciding by mood, not by slider names.
+const char* kBuiltinStyleDesc(int index) {
+    static constexpr const char* descs[kBuiltinStyleCount] = {
+        "完全还原游戏原始画面，包括关闭去色带、去雾与锐化。",
+        "血月：阴影沉入青蓝，高光燃起余烬橙红——Bloodborne 血月天空的走向，中间调保持中性。",
+        "苍白之梦：褪色的冷调印刷——黑位垫起、饱和收回、整体微亮，梦境与研究楼的空气感。",
+        "烛光夜曲：收紧黑位、高光染上烛火暖橙，Yharnam 街道夜战的伦勃朗式明暗。",
+        "银盐：黑白胶片相纸——黑位白位同时收紧、高颗粒，影调质感代替色彩。",
+    };
+    return descs[std::clamp(index, 0, kBuiltinStyleCount - 1)];
+}
 
 /// User slots. std::string because the name comes from the popup's input field.
 std::vector<StyleSlot> g_user_styles;
@@ -315,6 +465,13 @@ bool g_user_styles_loaded = false;
 bool g_style_list_dirty = false;
 bool save_style_popup = false;
 char save_style_name[64] = "";
+
+/// The user's own look: the full filter state as it stood right after their last manual
+/// slider edit, whenever that did not coincide with a preset. The combo shows a 自定义
+/// entry while the live state matches no preset; picking it restores this snapshot.
+/// Persisted in user-presets.json as "custom" so it survives restarts.
+StyleSlot g_custom_look{};
+bool g_custom_look_valid = false;
 
 /// user-presets.json next to bbport.ini (the same data-directory convention as
 /// cheats/state.txt and mods.json).
@@ -477,6 +634,62 @@ void LoadUserStyles() {
             g_user_styles.push_back(std::move(slot));
         }
     }
+
+    // The custom snapshot lives after the array as "custom": {...}. Searched from the array's
+    // end so a user-named slot can never shadow it. A missing or broken snapshot just leaves
+    // the entry disabled; nothing here is allowed to take the menu down.
+    const size_t array_end = text.find(']', pos);
+    if (array_end == std::string::npos) {
+        return;
+    }
+    const size_t custom_key = text.find("\"custom\"", array_end);
+    if (custom_key == std::string::npos) {
+        return;
+    }
+    pos = text.find('{', custom_key);
+    if (pos == std::string::npos) {
+        return;
+    }
+    ++pos;
+    StyleSlot snap{};
+    snap.name = "自定义";
+    // Missing members keep the neutral values; the file is written whole, so gaps only come
+    // from a hand edit.
+    snap.mono = false;
+    while (true) {
+        skip_ws();
+        if (pos >= text.size() || text[pos] == '}') {
+            break;
+        }
+        std::string key, value;
+        if (!read_member(key, value)) {
+            return; // malformed snapshot: leave it invalid rather than half-applied
+        }
+        if (key == "shadow") snap.shadow = to_int(value, 0);
+        else if (key == "contrast") snap.contrast = to_int(value, 0);
+        else if (key == "sat") snap.sat = to_int(value, 0);
+        else if (key == "vib") snap.vib = to_int(value, 0);
+        else if (key == "lr") snap.lr = to_int(value, 0);
+        else if (key == "lg") snap.lg = to_int(value, 0);
+        else if (key == "lb") snap.lb = to_int(value, 0);
+        else if (key == "gr") snap.gr = to_int(value, 0);
+        else if (key == "gg") snap.gg = to_int(value, 0);
+        else if (key == "gb") snap.gb = to_int(value, 0);
+        else if (key == "sr") snap.sr = to_int(value, 0);
+        else if (key == "sg") snap.sg = to_int(value, 0);
+        else if (key == "sb") snap.sb = to_int(value, 0);
+        else if (key == "lbk") snap.lbk = to_int(value, 0);
+        else if (key == "lwh") snap.lwh = to_int(value, 0);
+        else if (key == "grain") snap.grain = to_int(value, 0);
+        else if (key == "mono") snap.mono = value == "true" || value == "1";
+        else if (key == "split") snap.split = value == "true" || value == "1";
+        else if (key == "deband") snap.deband = to_int(value, 0);
+        else if (key == "defog") snap.defog = to_int(value, 0);
+        else if (key == "sharpen") snap.sharpen = to_int(value, 0);
+        else if (key == "range") snap.range = to_int(value, 12);
+    }
+    g_custom_look = std::move(snap);
+    g_custom_look_valid = true;
 }
 
 void SaveUserStyles() {
@@ -513,9 +726,36 @@ void SaveUserStyles() {
                      p.gg, p.gb, p.sr, p.sg, p.sb, p.lbk, p.lwh, p.grain, p.mono ? "true" : "false",
                      i + 1 == g_user_styles.size() ? "" : ",");
     }
-    std::fprintf(f, "  ]\n}\n");
+    std::fprintf(f, "  ]\n");
+    // The custom snapshot rides along when one exists, so clicking 自定义 restores the
+    // user's own look even after a restart.
+    if (g_custom_look_valid) {
+        std::fprintf(f,
+                     "  \"custom\": {\"shadow\": %d, \"contrast\": %d, \"sat\": %d, \"vib\": %d, "
+                     "\"lr\": %d, \"lg\": %d, \"lb\": %d, \"gr\": %d, \"gg\": %d, \"gb\": %d, "
+                     "\"sr\": %d, \"sg\": %d, \"sb\": %d, \"lbk\": %d, \"lwh\": %d, "
+                     "\"grain\": %d, \"mono\": %s, \"split\": %s, "
+                     "\"deband\": %d, \"defog\": %d, \"sharpen\": %d, \"range\": %d}\n",
+                     g_custom_look.shadow, g_custom_look.contrast, g_custom_look.sat,
+                     g_custom_look.vib, g_custom_look.lr, g_custom_look.lg, g_custom_look.lb,
+                     g_custom_look.gr, g_custom_look.gg, g_custom_look.gb, g_custom_look.sr,
+                     g_custom_look.sg, g_custom_look.sb, g_custom_look.lbk, g_custom_look.lwh,
+                     g_custom_look.grain, g_custom_look.mono ? "true" : "false",
+                     g_custom_look.split ? "true" : "false", g_custom_look.deband,
+                     g_custom_look.defog, g_custom_look.sharpen, g_custom_look.range);
+    }
+    std::fprintf(f, "}\n");
     std::fclose(f);
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+    // UCRT's rename() fails with EEXIST when the target already exists (POSIX replaces
+    // unconditionally), so every save after the first would fail. MoveFileEx with
+    // MOVEFILE_REPLACE_EXISTING is the Windows equivalent of POSIX rename.
+#ifdef _WIN32
+    const bool replaced = MoveFileExA(tmp.c_str(), path.c_str(),
+                                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+#else
+    const bool replaced = std::rename(tmp.c_str(), path.c_str()) == 0;
+#endif
+    if (!replaced) {
         std::printf("Overlay: cannot replace %s\n", path.c_str());
         try {
             std::remove(tmp.c_str());
@@ -531,6 +771,52 @@ void DeleteUserStyle(int index) {
     g_user_styles.erase(g_user_styles.begin() + index);
     g_style_list_dirty = true;
     SaveUserStyles();
+}
+
+/// Snapshots the complete filter state as it stands now (called right after a slider edit
+/// landed). This is what the 自定义 entry later restores: the look as the user last left it
+/// by hand.
+void CaptureCustomLook(const BbSettings::Values& s) {
+    g_custom_look = StyleSlot{
+        "自定义",          s.post_shadow,     s.post_contrast,   s.post_saturation,
+        s.post_vibrance,   s.post_lift_r,     s.post_lift_g,     s.post_lift_b,
+        s.post_gamma_r,    s.post_gamma_g,    s.post_gamma_b,    s.post_gain_r,
+        s.post_gain_g,     s.post_gain_b,     s.post_levels_black, s.post_levels_white,
+        s.post_grain,      s.post_mono,       false,
+        s.post_deband,     s.post_defog,      s.post_sharpen,    s.post_range,
+        s.post_split};
+    g_custom_look_valid = true;
+}
+
+/// Restores the snapshot. The atomics' current values are the widget source, so each Store
+/// lands the remembered value; "changed" is forced because the menu repaints from the atomics.
+void RestoreCustomLook(BbSettings::Values& s) {
+    if (!g_custom_look_valid) {
+        return;
+    }
+    const StyleSlot& p = g_custom_look;
+    Store(s.post_deband, p.deband, true);
+    Store(s.post_defog, p.defog, true);
+    Store(s.post_sharpen, p.sharpen, true);
+    Store(s.post_range, p.range, true);
+    Store(s.post_split, p.split, true);
+    Store(s.post_shadow, p.shadow, true);
+    Store(s.post_contrast, p.contrast, true);
+    Store(s.post_saturation, p.sat, true);
+    Store(s.post_vibrance, p.vib, true);
+    Store(s.post_lift_r, p.lr, true);
+    Store(s.post_lift_g, p.lg, true);
+    Store(s.post_lift_b, p.lb, true);
+    Store(s.post_gamma_r, p.gr, true);
+    Store(s.post_gamma_g, p.gg, true);
+    Store(s.post_gamma_b, p.gb, true);
+    Store(s.post_gain_r, p.sr, true);
+    Store(s.post_gain_g, p.sg, true);
+    Store(s.post_gain_b, p.sb, true);
+    Store(s.post_levels_black, p.lbk, true);
+    Store(s.post_levels_white, p.lwh, true);
+    Store(s.post_grain, p.grain, true);
+    Store(s.post_mono, p.mono, true);
 }
 
 void DrawSaveStylePopup() {
@@ -571,7 +857,7 @@ void DrawSaveStylePopup() {
                                                s.post_gain_r,    s.post_gain_g,
                                                s.post_gain_b,    s.post_levels_black,
                                                s.post_levels_white, s.post_grain,
-                                               s.post_mono}));
+                                               s.post_mono, false}));
         SaveUserStyles();
         g_style_list_dirty = true;
         save_style_popup = false;
@@ -586,7 +872,18 @@ void DrawSaveStylePopup() {
     ImGui::EndPopup();
 }
 
+/// Whether the correction sliders are all at their neutral values. Any active correction
+/// means no preset can be showing — presets do not own corrections — so the combo must read
+/// 自定义 (the user's own look) whenever this is false.
+bool CorrectionsAtDefault(const BbSettings::Values& s) {
+    return s.post_deband == 0 && s.post_defog == 0 && s.post_sharpen == 0 &&
+           s.post_range == 12 && !s.post_split;
+}
+
 bool StyleMatches(const StyleSlot& p, const BbSettings::Values& s) {
+    if (!CorrectionsAtDefault(s)) {
+        return false;
+    }
     return s.post_shadow == p.shadow && s.post_contrast == p.contrast &&
            s.post_saturation == p.sat && s.post_vibrance == p.vib &&
            s.post_lift_r == p.lr && s.post_lift_g == p.lg && s.post_lift_b == p.lb &&
@@ -594,6 +891,17 @@ bool StyleMatches(const StyleSlot& p, const BbSettings::Values& s) {
            s.post_gain_r == p.sr && s.post_gain_g == p.sg && s.post_gain_b == p.sb &&
            s.post_levels_black == p.lbk && s.post_levels_white == p.lwh &&
            s.post_grain == p.grain && s.post_mono == p.mono;
+}
+
+/// First matching built-in or user slot, or null while the state is the user's own look.
+/// Both the combo highlight and the snapshot gate below run off this.
+const StyleSlot* MatchedStyle(const BbSettings::Values& s) {
+    for (const auto& p : StylePresets()) {
+        if (StyleMatches(p, s)) {
+            return &p;
+        }
+    }
+    return nullptr;
 }
 
 void ApplyStyle(const StyleSlot& p, BbSettings::Values& s) {
@@ -614,6 +922,13 @@ void ApplyStyle(const StyleSlot& p, BbSettings::Values& s) {
     Store(s.post_levels_white, p.lwh, true);
     Store(s.post_grain, p.grain, true);
     Store(s.post_mono, p.mono, true);
+    if (p.full_reset) {
+        Store(s.post_deband, 0, true);
+        Store(s.post_defog, 0, true);
+        Store(s.post_sharpen, 0, true);
+        Store(s.post_range, 12, true);
+        Store(s.post_split, false, true);
+    }
 }
 
 const char* PageName(int page) {
@@ -637,6 +952,9 @@ void RestartNotice() {
     ImGui::Spacing();
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "有更改将在重启游戏后生效");
     if (ImGui::Button("应用并重启游戏")) {
+        // Save synchronously: runtime_restart() ends the process with _exit(0), which does not
+        // wait for detached threads, so the heartbeat's pending write would be lost and the
+        // new process would come up on the settings the user just changed away from.
         BbSettings::Save();
         runtime_restart();
     }
@@ -644,6 +962,10 @@ void RestartNotice() {
 
 void GraphicsPage() {
     auto& s = BbSettings::Get();
+    // The 自定义 snapshot captures the whole page's state at the end of the pass when any of
+    // its sliders landed an edit this frame. Cleared here so a Store() from another page
+    // (display, advanced) cannot leak into it.
+    grade_edited_this_frame = false;
     const bool taa = s.upscaler == BbSettings::UpscalerTaa;
     static const char* upscalers[] = {"关闭", "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1 (INT8)",
                                      "TAA（原生抗锯齿）", "DLSS（NVIDIA）"};
@@ -681,7 +1003,7 @@ void GraphicsPage() {
         ImGui::PopTextWrapPos();
     }
     if (BbSettings::IsFsr4(s.upscaler)) {
-        if (ImGui::CollapsingHeader("FSR 4 选项", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (CollapsingHeader("FSR 4 选项", true)) {
             if (s.upscaler == BbSettings::UpscalerFsr411) {
                 Hint("FSR 4.1.1 的 INT8 模式：模型来自 AMD 4.1.1 DLL，在 Vulkan 上重放（输出与 "
                      "DLL 一致）。Native..Performance 共用一个模型，Ultra Performance 单独一个。"
@@ -698,7 +1020,7 @@ void GraphicsPage() {
         }
     }
     if (s.upscaler == BbSettings::UpscalerDlss) {
-        if (ImGui::CollapsingHeader("DLSS 选项", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (CollapsingHeader("DLSS 选项", true)) {
             static constexpr struct {
                 int value;
                 const char* name;
@@ -776,10 +1098,10 @@ void GraphicsPage() {
         Hint("原生抗锯齿：超分算法只作抗锯齿用。其他档位按输出分辨率等比降低场景渲染分辨率。"
              "UI 以输出分辨率绘制。档位从下一帧起生效，无需重启游戏。");
     }
-    if (ImGui::CollapsingHeader("超分增强", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (CollapsingHeader("超分增强", true)) {
         Checkbox("锐化（RCAS）", s.sharpen);
         ImGui::BeginDisabled(!s.sharpen);
-        Slider("锐化强度", s.sharpness, 0.0f, 2.0f);
+        SliderWithDefault("锐化强度", s.sharpness, 0.30f, 0.0f, 2.0f);
         Hint("1 以内：超分自带的锐化（RCAS）。1 以上会追加一次 RCAS。DLSS 自身无锐化："
              "由 RCAS 一并完成。Ctrl+点击滑杆可输入精确值。");
         ImGui::EndDisabled();
@@ -787,7 +1109,7 @@ void GraphicsPage() {
         Hint("每帧场景偏移不到一个像素，超分从多帧聚合更多细节。关闭后只剩基于历史帧的抗锯齿。");
     }
 
-    if (ImGui::CollapsingHeader("响应式遮罩与运动矢量")) {
+    if (CollapsingHeader("响应式遮罩与运动矢量")) {
         ImGui::BeginDisabled(taa);
         Checkbox("启用遮罩", s.reactive);
         Hint("标记透明特效（粒子、雾霭），让超分少依赖过去的帧。特效后的拖影减少，"
@@ -798,7 +1120,9 @@ void GraphicsPage() {
         Slider("上限", s.reactive_max, 0.0f, 1.0f);
         bool show_mask = s.debug_view == BbSettings::DebugReactive;
         if (ImGui::Checkbox("显示遮罩（调试）", &show_mask)) {
-            s.debug_view = show_mask ? BbSettings::DebugReactive : BbSettings::DebugNone;
+            Store(s.debug_view, static_cast<int>(show_mask ? BbSettings::DebugReactive
+                                                              : BbSettings::DebugNone),
+                  true);
         }
         ImGui::EndDisabled();
         ImGui::EndDisabled();
@@ -807,7 +1131,9 @@ void GraphicsPage() {
              "更改在重启游戏后生效。");
         bool show_motion = s.debug_view == BbSettings::DebugMotion;
         if (ImGui::Checkbox("显示运动矢量（调试）", &show_motion)) {
-            s.debug_view = show_motion ? BbSettings::DebugMotion : BbSettings::DebugNone;
+            Store(s.debug_view, static_cast<int>(show_motion ? BbSettings::DebugMotion
+                                                               : BbSettings::DebugNone),
+                  true);
         }
         Hint("红/绿：水平/垂直运动（8 像素 = 全亮度）。蓝：该像素拿到了精确的物体矢量，"
              "而不只是相机运动。运动物体既没有蓝也没有红/绿时会被超分当作静止，"
@@ -869,7 +1195,7 @@ void DisplayPage() {
     }
     Hint("窗口移到所选显示器的中央，立即生效。");
 
-    if (ImGui::CollapsingHeader("输出分辨率##hdr", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (CollapsingHeader("输出分辨率##hdr", true)) {
         static const char* outputs[] = {"1280 x 720", "1920 x 1080", "2560 x 1440", "3840 x 2160"};
         int output = s.output_res;
         if (ImGui::BeginCombo("输出分辨率", outputs[output])) {
@@ -928,11 +1254,21 @@ void DisplayPage() {
     Checkbox("低延迟模式（Reflex）", s.low_latency);
     Hint("NVIDIA RTX 专属：驱动把渲染队列压到 present 之前、并按节拍放行下一帧，输入到画面的"
          "延迟可降低约一半；开启后 FPS 读数附带驱动测量的帧延迟。立即生效。");
+    if (grade_edited_this_frame && !MatchedStyle(s)) {
+        // A manual edit landed this frame AND the result matches no preset: that is the
+        // moment the user's own look changes, so the 自定义 snapshot follows it. Applying a
+        // preset also flows through Store() (hence the flag), but the state then matches the
+        // preset — capturing here would overwrite the user's own look with the preset's.
+        CaptureCustomLook(s);
+    }
     RestartNotice();
 }
 
 void EffectsPage() {
     auto& s = BbSettings::Get();
+    // The 自定义 snapshot is taken at the end of this page's pass when a filter slider landed
+    // an edit this frame; cleared here so edits from other pages cannot leak into it.
+    grade_edited_this_frame = false;
     static const char* lods[] = {"最高 (-2)", "游戏默认", "较低 (1)", "最低 (2)"};
     static constexpr int lod_values[] = {-2, 0, 1, 2};
     int lod_index = 1;
@@ -947,16 +1283,16 @@ void EffectsPage() {
         }
         ImGui::EndCombo();
     }
-    if (ImGui::CollapsingHeader("后处理（去色带 / 调色 / 锐化）")) {
+    if (CollapsingHeader("后处理（去色带 / 调色 / 锐化）")) {
         {
-            // One-click looks: they only move the colour-grade sliders below (shadow, contrast,
-            // saturation, vibrance, CDL, levels, grain, mono); deband/defog/sharpen stay put.
+            // One-click looks plus the user's own "自定义" state.
             //
-            // The five built-ins are compiled in, but the list is a runtime vector: the user can
-            // save the current grade as a named slot, rename it, reorder and delete it. Slots
-            // live in user-presets.json next to bbport.ini, the same data-directory convention
-            // as cheats/state.txt and mods.json — bbport.ini stays the start-up configuration and
-            // does not collect run-time artefacts.
+            // Interaction model (ReShade/Lightroom semantics): a preset only ever moves the
+            // sliders it owns; the moment any filter slider is edited by hand the combo reads
+            // 自定义, and picking that entry restores the state as the user last left it
+            // (snapshot taken after every manual edit, persisted in user-presets.json).
+            // 原味 additionally clears the correction sliders, so it is the true unmodified
+            // game picture; the other built-ins leave corrections alone.
             int current = -1;
             for (int i = 0; i < int(StylePresets().size()); ++i) {
                 if (StyleMatches(StylePresets()[i], s)) {
@@ -968,10 +1304,8 @@ void EffectsPage() {
             // StylePresets()[i].name is a std::string; the preview is read-only, so the
             // pointer only has to outlive this frame — the vector is a function-local static
             // that lives until the process ends.
-            const char* preview = "自定义";
-            if (current >= 0) {
-                preview = StylePresets()[current].name.c_str();
-            }
+            const bool on_custom = current < 0;
+            const char* preview = on_custom ? "自定义" : StylePresets()[current].name.c_str();
             if (ImGui::BeginCombo("风格预设", preview)) {
                 // Built-ins first, then a separator and the user's own slots. Both live in the
                 // same combined list, so index i in StylePresets() addresses both.
@@ -983,6 +1317,9 @@ void EffectsPage() {
                     }
                     if (ImGui::Selectable(StylePresets()[i].name.c_str(), i == current)) {
                         ApplyStyle(StylePresets()[i], s);
+                    }
+                    if (i < StyleUserBase && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) {
+                        ImGui::SetTooltip(kBuiltinStyleDesc(std::min(i, kBuiltinStyleCount - 1)));
                     }
                     if (i >= StyleUserBase) {
                         // This ImGui version (1.92.9b) dropped EndPopupContextItem: Begin
@@ -997,134 +1334,115 @@ void EffectsPage() {
                         }
                     }
                 }
+                ImGui::Separator();
+                ImGui::TextDisabled("手动状态");
+                // The user's own look. Disabled until at least one manual edit has been made
+                // (this session or a previous one — the snapshot persists), because before
+                // that there is nothing to restore beyond the presets already listed.
+                ImGui::BeginDisabled(!g_custom_look_valid);
+                if (ImGui::Selectable("自定义", on_custom)) {
+                    RestoreCustomLook(s);
+                }
+                ImGui::EndDisabled();
+                if (!g_custom_look_valid && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) {
+                    ImGui::SetTooltip("还没有手动调整过滤镜；先动一下下面的滑杆。");
+                }
                 ImGui::EndCombo();
             }
             ImGui::SameLine();
-            if (ImGui::Button("保存当前")) {
+            if (ImGui::Button("保存为风格")) {
                 save_style_popup = true; // drawn by DrawSaveStylePopup() below
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("把当前的调色参数存为“我的风格”槽位");
+                ImGui::SetTooltip("把当前的滤镜参数存为一个命名槽位（自定义状态会自动记住，"
+                                  "不需要保存）");
             }
             if (save_style_popup) {
                 DrawSaveStylePopup();
             }
-            Hint("一键套用调色：只动下面的调色滑杆（暗部、对比、饱和、智能饱和、三级调色、黑白场、"
-                 "颗粒、单色），去色带、去雾与锐化不受影响；滑杆改动后显示为自定义。");
+            Hint("预设只改它名下的滑杆；手动调整任一滑杆后显示为自定义，再点自定义即可回到"
+                 "上次手动调好的状态（跨启动保留）。原味会把画面完全还原为游戏原样，"
+                 "包括关闭去色带、去雾与锐化。");
         }
         {
-            int v = s.post_deband;
             Hint("去色带：天空、雾与暗部的 8-bit 分层感。mpv/libplacebo 同款算法，0 关闭，"
                  "低档最接近 mpv 默认。全部参数立即生效。");
-            const bool changed = ImGui::SliderInt("去色带强度", &v, 0, 100, "%d%%");
-            Store(s.post_deband, v, changed);
+            SliderWithDefault("去色带强度", s.post_deband, 50, 0, 100, "%d%%");
         }
         {
-            int v = s.post_range;
             Hint("去色带采样半径。链在放大之后运行，条带被拉宽：约 2 倍放大建议 16-24；"
                  "大半径平滑更长渐变，小半径更保守。");
-            const bool changed = ImGui::SliderInt("去色带半径（像素）", &v, 4, 32);
-            Store(s.post_range, v, changed);
+            SliderWithDefault("去色带半径（像素）", s.post_range, 12, 4, 32);
         }
         {
-            int v = s.post_defog;
             Hint("去雾：减去一层均匀灰雾（100% 相当于 1/4 白的黑位下拉）。对实机远景的"
                  "灰蒙感有效；游戏内的体积浓雾是美术设计，过度去雾会伤氛围。");
-            const bool changed = ImGui::SliderInt("去雾强度", &v, 0, 100, "%d%%");
-            Store(s.post_defog, v, changed);
+            SliderWithDefault("去雾强度", s.post_defog, 0, 0, 100, "%d%%");
         }
         {
-            int v = s.post_shadow;
             Hint("暗部提升：近黑区域按乘法曲线提亮（100% 时最亮约 1.3 倍），黑点保持纯黑，"
                  "不雾化黑位。");
-            const bool changed = ImGui::SliderInt("暗部提升", &v, 0, 100, "%d%%");
-            Store(s.post_shadow, v, changed);
+            SliderWithDefault("暗部提升", s.post_shadow, 0, 0, 100, "%d%%");
         }
         {
-            int v = s.post_contrast;
             Hint("对比度：绕中间灰拉伸明暗（100% 约为 1.3 倍），中间灰与黑点均不动，"
                  "0 不生效。先去雾再拉伸。");
-            const bool changed = ImGui::SliderInt("对比度", &v, 0, 100, "%d%%");
-            Store(s.post_contrast, v, changed);
+            SliderWithDefault("对比度", s.post_contrast, 0, 0, 100, "%d%%");
         }
         {
-            int v = s.post_saturation;
             Hint("饱和度：离开 Rec.709 亮度轴调整彩度（100% 约为 1.4 倍，-100% 约 0.6 倍），"
                  "0 不生效。游戏本身偏浓艳，建议从 10 到 30 起步，负值做低饱和的胶片感。");
-            const bool changed = ImGui::SliderInt("饱和度", &v, -100, 100, "%d%%");
-            Store(s.post_saturation, v, changed);
+            SliderWithDefault("饱和度", s.post_saturation, 0, -100, 100, "%d%%");
         }
         {
-            int v = s.post_sharpen;
             Hint("锐化：AMD RCAS（FSR 附带的锐化内核），与画面页超分自带的锐化独立，通常二选一。");
-            const bool changed = ImGui::SliderInt("锐化强度", &v, 0, 100, "%d%%");
-            Store(s.post_sharpen, v, changed);
+            SliderWithDefault("锐化强度", s.post_sharpen, 0, 0, 100, "%d%%");
         }
         Checkbox("分割对比（左半原帧）", s.post_split);
         Hint("排查用：左半屏保留未处理的原始画面，右半屏走后处理链，用于逐项核对"
              "色彩与算法偏差。");
-        if (ImGui::CollapsingHeader("智能饱和（Vibrance）")) {
-            int v = s.post_vibrance;
+        if (CollapsingHeader("智能饱和（Vibrance）")) {
             Hint("ReShade Vibrance 同款：沿亮度轴拉高彩度，越不饱和的像素加得越多，肤色附近"
                  "有保护罩，防止人脸过饱和。0 关闭。");
-            const bool changed = ImGui::SliderInt("智能饱和", &v, 0, 100, "%d%%");
-            Store(s.post_vibrance, v, changed);
+            SliderWithDefault("智能饱和", s.post_vibrance, 0, 0, 100, "%d%%");
         }
-        if (ImGui::CollapsingHeader("三级调色（Lift / Gamma / Gain）")) {
+        if (CollapsingHeader("三级调色（Lift / Gamma / Gain）")) {
             Hint("ASC CDL（ReShade Lift_Gamma_Gain 同源数学）：增益乘高光、提升垫阴影"
                  "（100% = ±0.20 黑位）、伽马幂调中间调（+ 变亮）。各通道独立可做分离"
                  "色调，0 为中性。");
             {
-                int r = s.post_lift_r, g = s.post_lift_g, b = s.post_lift_b;
-                const bool cr = ImGui::SliderInt("提升 R", &r, -100, 100);
-                const bool cg = ImGui::SliderInt("提升 G", &g, -100, 100);
-                const bool cb = ImGui::SliderInt("提升 B", &b, -100, 100);
-                Store(s.post_lift_r, r, cr);
-                Store(s.post_lift_g, g, cg);
-                Store(s.post_lift_b, b, cb);
-            }
-            {
-                int r = s.post_gamma_r, g = s.post_gamma_g, b = s.post_gamma_b;
-                const bool cr = ImGui::SliderInt("伽马 R", &r, -100, 100);
-                const bool cg = ImGui::SliderInt("伽马 G", &g, -100, 100);
-                const bool cb = ImGui::SliderInt("伽马 B", &b, -100, 100);
-                Store(s.post_gamma_r, r, cr);
-                Store(s.post_gamma_g, g, cg);
-                Store(s.post_gamma_b, b, cb);
-            }
-            {
-                int r = s.post_gain_r, g = s.post_gain_g, b = s.post_gain_b;
-                const bool cr = ImGui::SliderInt("增益 R", &r, -100, 100);
-                const bool cg = ImGui::SliderInt("增益 G", &g, -100, 100);
-                const bool cb = ImGui::SliderInt("增益 B", &b, -100, 100);
-                Store(s.post_gain_r, r, cr);
-                Store(s.post_gain_g, g, cg);
-                Store(s.post_gain_b, b, cb);
-            }
-        }
-        if (ImGui::CollapsingHeader("黑白场（Levels）")) {
-            int v = s.post_levels_black;
-            Hint("输入黑点：低于该亮度的像素压到纯黑，100% 约为 1/2 亮度。收紧黑位、"
-                 "提对比的第一手段，0 不动。");
-            const bool changed = ImGui::SliderInt("黑场", &v, 0, 100, "%d%%");
-            Store(s.post_levels_black, v, changed);
-            v = s.post_levels_white;
-            Hint("输入白点：高于该亮度的像素推到纯白，100% 约为 1/2 亮度。黑场白场共同决定"
-                 "输入范围，收得过窄会硬切画面细节。");
-            const bool changed2 = ImGui::SliderInt("白场", &v, 0, 100, "%d%%");
-            Store(s.post_levels_white, v, changed2);
+            SliderWithDefault("提升 R", s.post_lift_r, 0, -100, 100);
+            SliderWithDefault("提升 G", s.post_lift_g, 0, -100, 100);
+            SliderWithDefault("提升 B", s.post_lift_b, 0, -100, 100);
         }
         {
-            int v = s.post_grain;
+            SliderWithDefault("伽马 R", s.post_gamma_r, 0, -100, 100);
+            SliderWithDefault("伽马 G", s.post_gamma_g, 0, -100, 100);
+            SliderWithDefault("伽马 B", s.post_gamma_b, 0, -100, 100);
+        }
+        {
+            SliderWithDefault("增益 R", s.post_gain_r, 0, -100, 100);
+            SliderWithDefault("增益 G", s.post_gain_g, 0, -100, 100);
+            SliderWithDefault("增益 B", s.post_gain_b, 0, -100, 100);
+        }
+        }
+        if (CollapsingHeader("黑白场（Levels）")) {
+            Hint("输入黑点：低于该亮度的像素压到纯黑，100% 约为 1/2 亮度。收紧黑位、"
+                 "提对比的第一手段，0 不动。");
+            SliderWithDefault("黑场", s.post_levels_black, 0, 0, 100, "%d%%");
+            Hint("输入白点：高于该亮度的像素推到纯白，100% 约为 1/2 亮度。黑场白场共同决定"
+                 "输入范围，收得过窄会硬切画面细节。");
+            SliderWithDefault("白场", s.post_levels_white, 0, 0, 100, "%d%%");
+        }
+        {
             Hint("胶片颗粒：乘性高斯噪声（SweetFX FilmGrain 同源数学），暗部更重、黑点不动，"
                  "最后生还者式的低光颗粒感。与去色带的抖动共用随机流，不额外采样。");
-            const bool changed = ImGui::SliderInt("胶片颗粒", &v, 0, 100, "%d%%");
-            Store(s.post_grain, v, changed);
+            SliderWithDefault("胶片颗粒", s.post_grain, 0, 0, 100, "%d%%");
         }
         Checkbox("单色（黑白）", s.post_mono);
         Hint("按 Rec.709 亮度去色，配合颗粒与对比即高对比黑白胶片。");
     }
-    if (ImGui::CollapsingHeader("游戏效果开关", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (CollapsingHeader("游戏效果开关", true)) {
         for (int e = 0; e < BbSettings::EffectCount; ++e) {
             Checkbox(BbSettings::Effects[e].label, s.effects[e]);
         }
@@ -1133,6 +1451,11 @@ void EffectsPage() {
         Hint("自由视角：按住叉键再按 L3（键盘：Space + Z）。调试菜单：左侧触控板 / Tab。"
              "需要 Nexus mod #253 的 DbgFont14h.ccm 和 DbgFont14h.tpf 放入 dvdroot_ps4/font。"
              "右侧触控板：退格。");
+    }
+    if (grade_edited_this_frame && !MatchedStyle(s)) {
+        // Same contract as the capture on the graphics page: a manual filter edit that
+        // matches no preset moves the user's own look, so the 自定义 snapshot follows it.
+        CaptureCustomLook(s);
     }
     RestartNotice();
 }
@@ -1196,7 +1519,7 @@ void AdvancedPage() {
         ImGui::EndCombo();
     }
     Hint("任天堂布局手柄选最后一项，立即生效。BB_PAD_SWAP 可在启动时预设同样的值。");
-    if (ImGui::CollapsingHeader("资源调度（纹理缓存）")) {
+    if (CollapsingHeader("资源调度（纹理缓存）")) {
         ImGui::Text("显存用量 %llu MiB（加压线 %llu / 临界线 %llu MiB）",
                     (unsigned long long)(gc_stats.used_memory.load() >> 20),
                     (unsigned long long)(gc_stats.pressure_memory.load() >> 20),
@@ -1214,8 +1537,7 @@ void CheatsPage() {
     if (const int cheat_files = bbcheats_file_count()) {
         for (int f = 0; f < cheat_files; ++f) {
             ImGui::PushID(f);
-            if (ImGui::CollapsingHeader(bbcheats_file_name(f),
-                                        f == 0 && cheat_files == 1 ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
+            if (CollapsingHeader(bbcheats_file_name(f), f == 0 && cheat_files == 1)) {
                 if (bbcheats_master_available(f)) {
                     bool master = bbcheats_master_enabled(f);
                     ImGui::BeginDisabled(master); // the master section has no off bytes
@@ -1752,6 +2074,17 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (ms > 0.0f && ms < 1000.0f) {
         frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
         frame_ms_max = ms > frame_ms_max ? ms : frame_ms_max * 0.97f;
+    }
+    // Auto-save heartbeat, deliberately before the Visible() early-out below: with the menu
+    // closed and the FPS counter off there is no other work in this function, and that is
+    // exactly the state a killed process is in. The interval bounds how much a crash can cost
+    // to the edits of the last second; the file write itself is on a detached thread because
+    // this runs while the present thread holds imgui_mutex. The flag is only taken when the
+    // save actually fires — clearing it first would swallow edits made inside the interval.
+    const auto now_save = std::chrono::steady_clock::now();
+    if (now_save - last_save >= std::chrono::seconds(1) && settings_dirty.exchange(false)) {
+        last_save = now_save;
+        std::thread([] { BbSettings::Save(); }).detach();
     }
     if (!Visible()) {
         return;

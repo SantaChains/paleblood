@@ -257,17 +257,19 @@ typedef struct {
 static int parse_job(const unsigned char *p, uint32_t size, Job *job) {
     memset(job,0,sizeof(*job));
     for (const unsigned char *end=p+size; p<end;) {
+        if (end-p<4) return -1;
         uint32_t word; memcpy(&word,p,4);
         switch (ident(word)) {
         case IDENT_CONTROL_FLAGS: case IDENT_RUN_FLAGS: {
+            if (end-p<8) return -1;
             Chunk c; memcpy(&c,p,8);
             job->flags=((uint64_t)payload(c.word)<<32)|c.size; job->have_flags=1; p+=8; break;
         }
-        case IDENT_INPUT_RUN: if (job->input_count==16) return -1; memcpy(&job->inputs[job->input_count++],p,16); p+=16; break;
-        case IDENT_OUTPUT_RUN: if (job->output_count==16) return -1; memcpy(&job->outputs[job->output_count++],p,16); p+=16; break;
-        case IDENT_INPUT_CONTROL: memcpy(&job->input_control,p,16); p+=16; break;
-        case IDENT_OUTPUT_CONTROL: memcpy(&job->output_control,p,16); p+=16; break;
-        case IDENT_RETURN_ADDRESS: p+=16; break;
+        case IDENT_INPUT_RUN: if (job->input_count==16 || end-p<16) return -1; memcpy(&job->inputs[job->input_count++],p,16); p+=16; break;
+        case IDENT_OUTPUT_RUN: if (job->output_count==16 || end-p<16) return -1; memcpy(&job->outputs[job->output_count++],p,16); p+=16; break;
+        case IDENT_INPUT_CONTROL: if (end-p<16) return -1; memcpy(&job->input_control,p,16); p+=16; break;
+        case IDENT_OUTPUT_CONTROL: if (end-p<16) return -1; memcpy(&job->output_control,p,16); p+=16; break;
+        case IDENT_RETURN_ADDRESS: if (end-p<16) return -1; p+=16; break;
         default: return -1;
         }
     }
@@ -443,16 +445,23 @@ static ABI int32_t ajm_batch_start(uint32_t id, unsigned char *buffer, uint32_t 
     for (int i=0;i<MAX_BATCHES;++i) if (!batches[i].used) { slot=i; break; }
     if (slot<0) { host_recursive_unlock(&lock); return ERR_OUT_OF_RESOURCES; }
     for (unsigned char *p=buffer, *end=buffer+size; p<end;) {
+        /* Chunk sizes are untrusted: bound the header read and the body advance so a
+         * malformed batch (including INLINE chunks) can never read past its buffer. */
+        if (end-p<8) {
+            if (error) { error->error_code=ERR_MALFORMED_BATCH; error->job_address=p; error->command_offset=(uint32_t)(p-buffer); error->job_return_address=NULL; }
+            host_recursive_unlock(&lock);
+            return ERR_MALFORMED_BATCH;
+        }
         Chunk chunk; memcpy(&chunk,p,8);
         unsigned char *body=p+8;
         p=body+chunk.size;
-        if (ident(chunk.word)==IDENT_INLINE) continue;
         Job job;
-        if (ident(chunk.word)!=IDENT_JOB || p>end || parse_job(body,chunk.size,&job)) {
+        if (p>end || (ident(chunk.word)!=IDENT_INLINE && (ident(chunk.word)!=IDENT_JOB || parse_job(body,chunk.size,&job)))) {
             if (error) { error->error_code=ERR_MALFORMED_BATCH; error->job_address=body-8; error->command_offset=(uint32_t)(body-8-buffer); error->job_return_address=NULL; }
             host_recursive_unlock(&lock);
             return ERR_MALFORMED_BATCH;
         }
+        if (ident(chunk.word)==IDENT_INLINE) continue;
         run_job(c,payload(chunk.word),&job);
     }
     batches[slot]=(Batch){1,(int)id,0};

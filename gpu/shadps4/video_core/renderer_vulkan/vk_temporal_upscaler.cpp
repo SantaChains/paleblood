@@ -300,6 +300,9 @@ bool TemporalUpscaler::OnFrameStart() {
     const bool jitter_on = active && settings.jitter && !BbToggle::Disabled(1u << 25);
     const int upscaler = settings.upscaler.load();
     const int output = settings.output_res.load();
+    // The DLSS preset hint recreates the NGX feature in Record; a fresh model must start
+    // from a reset history like any other provider change.
+    const int dlss_preset = settings.dlss_preset.load();
     const bool output_changed = !scaled_session && applied_output != output;
     if (output_changed) {
         target_width = BbSettings::OutputWidths[output];
@@ -309,7 +312,8 @@ bool TemporalUpscaler::OnFrameStart() {
         fsr4_failed = false;
     }
     const bool changed = output_changed || applied_preset != preset || active != last_active ||
-                         jitter_on != last_jitter || applied_upscaler != upscaler;
+                         jitter_on != last_jitter || applied_upscaler != upscaler ||
+                         (upscaler == BbSettings::UpscalerDlss && applied_dlss_preset != dlss_preset);
     if (applied_upscaler != upscaler) {
         // A failed provider keeps a fatal flag internally; a user retry gets a fresh context.
         scheduler.Finish();
@@ -332,6 +336,7 @@ bool TemporalUpscaler::OnFrameStart() {
     applied_preset = preset;
     applied_output = output;
     applied_upscaler = upscaler;
+    applied_dlss_preset = dlss_preset;
     last_active = active;
     last_jitter = jitter_on;
     dispatched_last_frame = false;

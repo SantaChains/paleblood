@@ -177,7 +177,11 @@ def encode(line):
         raise ValueError('patch line is missing Type or Value')
     if kind=='bytes': return bytes.fromhex(value.replace(' ',''))
     if kind in ('bytes16','bytes32','bytes64'):
-        return int(value,0).to_bytes(int(kind[5:])//8,'little')
+        width=int(kind[5:])//8
+        number=int(value,0)
+        if not 0<=number<1<<width*8:
+            raise ValueError(f'{kind} value {value!r} does not fit {width} bytes')
+        return number.to_bytes(width,'little')
     if kind=='float32': return struct.pack('<f',float(value))
     if kind=='float64': return struct.pack('<d',float(value))
     if kind=='utf8': return value.encode()+b'\0'
@@ -191,6 +195,10 @@ def compile_patches(xml, names, app_version, segments):
     # ET.parse raise a bare FileNotFoundError behind a generic "patches failed".
     if not xml.is_file():
         raise MissingPatchDatabase(xml)
+    if b'<!entity' in xml.read_bytes().lower():
+        # xml.etree expands internal general entities, so a hostile patch file could hang the
+        # launcher with an entity-expansion bomb. None of the community patch sets use them.
+        raise ValueError(f'{xml.name} declares XML entities; refusing to parse it')
     found={}
     for meta in ET.parse(xml).getroot().iter('Metadata'):
         if meta.get('Name') in names and meta.get('AppVer')==app_version and meta.get('AppElf','eboot.bin')=='eboot.bin':
@@ -296,7 +304,10 @@ def compile_stamp(a):
     external patch tree with their stats and this script. Font validation (game-dir) only
     guards the compile without changing the blob, so it stays out of the stamp."""
     def entry(path):
-        st=path.stat()
+        try:
+            st=path.stat()
+        except OSError: # a data dir without bbport.ini is legal (read_settings tolerates it)
+            return None
         return [os.path.normcase(str(path)),st.st_size,st.st_mtime_ns]
     files={'settings':entry(a.settings),'xml':entry(a.xml),'eboot':entry(a.out/'eboot.elf')}
     if a.patches_config and a.patches_config.is_file(): files['config']=entry(a.patches_config)

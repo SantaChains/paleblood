@@ -178,4 +178,18 @@ float PresetScale(int preset);
 const char* PresetName(int preset);
 const char* UpscalerName(int upscaler);
 
+// CollapsingHeader open/closed states, kept beside the other user-owned files rather than in
+// Values: this is menu layout, not runtime state, and Values is handed out as a const reference
+// by most readers, which a mutex member could not survive.
+//
+// ImGui itself does not persist these — they live in window->StateStorage and its ini writer
+// only has handlers for windows and tables (imgui.cpp:4472, imgui_tables.cpp:4260), so every
+// section reopened expanded on the next launch. They are stored as collapse_<label> keys in
+// bbport.ini instead; unknown keys are ignored on load, so renaming a section drops its state.
+bool CollapseOpen(const std::string& label, bool default_open);
+/// Records the new state; true when it changed from the remembered one.
+bool SetCollapseOpen(const std::string& label, bool open);
+/// Drops a remembered state (the header is back at its default); true when one was dropped.
+bool ForgetCollapse(const std::string& label);
+
 } // namespace BbSettings

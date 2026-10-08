@@ -271,7 +271,11 @@ static void replay_sample(PadData *d) {
             PadSample s; unsigned v[8]; size_t cap=0;
             while (f && fscanf(f,"%u %u %u %u %u %u %u %u",&v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&v[6],&v[7])==8) {
                 s=(PadSample){v[0],v[1],{(uint8_t)v[2],(uint8_t)v[3],(uint8_t)v[4],(uint8_t)v[5]},(uint8_t)v[6],(uint8_t)v[7]};
-                if (replay_count==cap && !(replay=realloc(replay,(cap=cap ? cap*2 : 1024)*sizeof(*replay)))) break;
+                if (replay_count==cap) {
+                    PadSample *grown=realloc(replay,(cap=cap ? cap*2 : 1024)*sizeof(*replay));
+                    if (!grown) { free(replay); replay=NULL; replay_count=0; break; }
+                    replay=grown;
+                }
                 replay[replay_count++]=s;
             }
             if (f) fclose(f);

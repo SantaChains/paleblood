@@ -453,7 +453,9 @@ struct DlssUpscaler::Impl {
         }
         const Key wanted{f.render_width, f.render_height, f.output.width, f.output.height,
                          Quality(f.preset), PresetHint(), IsFloatFormat(f.color.format)};
+        bool recreated = false;
         if (!feature || !(wanted == key)) {
+            recreated = true;
             if (feature) {
                 scheduler.Finish(); // the feature's resources may still be in use
                 release_feature(feature);
@@ -504,7 +506,7 @@ struct DlssUpscaler::Impl {
         SetF(params, "Jitter.Offset.X", f.jitter[0]);
         SetF(params, "Jitter.Offset.Y", f.jitter[1]);
         SetF(params, "Sharpness", 0.0f);
-        SetI(params, "Reset", f.reset ? 1 : 0);
+        SetI(params, "Reset", (f.reset || recreated) ? 1 : 0);
         SetF(params, "MV.Scale.X", 1.0f);
         SetF(params, "MV.Scale.Y", 1.0f);
         SetUI(params, "DLSS.Render.Subrect.Dimensions.Width", f.render_width);

@@ -1,5 +1,5 @@
 @echo off
-rem Windows counterpart of run.sh (scripts/run_windows.py): starts the game directly. Building
+rem Windows launcher (scripts/run_windows.py): starts the game directly. Building
 rem is separate: build.bat (or run.bat --build). Usage: run.bat [--game-dir DIR] [bb-probe options...]
 rem MSYS2 is expected in C:\msys64 (set BB_MSYS2 otherwise); see README "Windows".
 setlocal
@@ -23,7 +23,7 @@ if not exist "%BB_PYTHON%" (
 )
 :have_py
 if not exist "%BB_PYTHON%" (
-    echo No usable Python found. Install MSYS2 (see README.md) to build, or put any
+    echo No usable Python found. Install MSYS2 ^(see README.md^) to build, or put any
     echo Python 3.8+ on PATH to run a release zip.
     pause
     exit /b 1

@@ -14,9 +14,6 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#ifndef _WIN32
-#include <ftw.h>
-#endif
 
 #define ERR_PARAMETER ((int32_t)0x809F0000)
 #define ERR_NOT_INITIALIZED ((int32_t)0x809F0001)
@@ -134,11 +131,6 @@ static int read_param(const char *meta, Param *p) {
     if (!stat(path,&st)) p->mtime=st.st_mtime;
     return n==1 ? 0 : -1;
 }
-#ifndef _WIN32
-static int remove_entry(const char *path, const struct stat *st, int flag, struct FTW *ftw) {
-    (void)st; (void)flag; (void)ftw; return remove(path);
-}
-#endif
 
 static ABI int32_t save_initialize(const void *param) { (void)param; initialized=1; return 0; }
 static ABI int32_t save_terminate(void) {
@@ -251,9 +243,6 @@ static ABI int32_t save_delete(const Delete *d) {
 #ifdef _WIN32
     runtime_win_remove_tree(host);
     runtime_win_remove_tree(meta);
-#else
-    nftw(host,remove_entry,16,FTW_DEPTH|FTW_PHYS);
-    nftw(meta,remove_entry,16,FTW_DEPTH|FTW_PHYS);
 #endif
     printf("Runtime: save data '%s' deleted\n",d->dir->data);
     return 0;
@@ -284,7 +273,12 @@ static ABI int32_t save_search(const SearchCond *cond, SearchResult *result) {
         size_t n=strlen(e->d_name);
         if (e->d_name[0]=='.' || n>=32 || (n>8 && !strcmp(e->d_name+n-8,".sce_sys"))) continue;
         if (cond->dir && cond->dir->data[0] && !like(e->d_name,cond->dir->data)) continue;
-        if (count==capacity) { capacity=capacity ? capacity*2 : 16; entries=realloc(entries,capacity*sizeof(*entries)); }
+        if (count==capacity) {
+            capacity=capacity ? capacity*2 : 16;
+            Entry *grown=realloc(entries,capacity*sizeof(*entries));
+            if (!grown) { free(entries); entries=NULL; count=0; break; }
+            entries=grown;
+        }
         snprintf(entries[count].name,32,"%s",e->d_name);
         char meta[680]; snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,e->d_name);
         read_param(meta,&entries[count].param);

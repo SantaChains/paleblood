@@ -94,58 +94,7 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
     fflush(NULL);
     _exit(20); /* no destructors: GPU, audio and guest threads are still running */
 }
-#ifndef _WIN32
-/* enter_on_stack(entry, arg0, arg1, stack_top): call entry(arg0,arg1) on a new stack. */
-void enter_on_stack(void *entry, void *arg0, void *arg1, void *top);
-__asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
-        " push %rbp\n mov %rsp,%rbp\n and $-16,%rcx\n mov %rcx,%rsp\n"
-        " mov %rdi,%rax\n mov %rsi,%rdi\n mov %rdx,%rsi\n call *%rax\n"
-        " mov %rbp,%rsp\n pop %rbp\n ret\n");
-#endif
 static ABI void guest_exit(void) { puts("Runtime: process finalizer callback reached"); }
-#ifndef _WIN32
-static void fault(int sig, siginfo_t *info, void *context) {
-    /* GPU page tracking (write-protected guest pages) is resolved first. */
-    if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
-    /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
-    if ((sig == SIGSEGV || sig == SIGBUS) && runtime_fault_recover) {
-        sigjmp_buf *recover = runtime_fault_recover;
-        runtime_fault_recover = NULL;
-        sigset_t unblock;
-        sigemptyset(&unblock);
-        sigaddset(&unblock, sig);
-        pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
-        siglongjmp(*recover, 1);
-    }
-    /* The process is terminating: dladdr/snprintf are acceptable here. */
-    ucontext_t *uc = context;
-    uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
-    char line[512];
-    Dl_info where;
-    if (rip - (uintptr_t)image < 0x10000000)
-        snprintf(line, sizeof(line), "Guest fault (signal %d) at guest offset 0x%lx, address %p\n",
-                 sig, (unsigned long)(rip - (uintptr_t)image), info->si_addr);
-    else if (dladdr((void *)rip, &where) && where.dli_fname)
-        snprintf(line, sizeof(line), "Host fault (signal %d) in %s+0x%lx (%s), address %p\n", sig, where.dli_fname,
-                 (unsigned long)(rip - (uintptr_t)where.dli_fbase), where.dli_sname ? where.dli_sname : "?", info->si_addr);
-    else
-        snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
-    { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
-    if (gpu_enabled) bbgpu_dump_guest_writes(context);
-    /* Host call chain (frames with unwind info; guest frames end it). */
-    void *frames[32];
-    int depth = backtrace(frames, 32);
-    for (int i = 2; i < depth; ++i) {
-        if (dladdr(frames[i], &where) && where.dli_fname)
-            snprintf(line, sizeof(line), "  #%d %s+0x%lx (%s)\n", i, where.dli_fname,
-                     (unsigned long)((uintptr_t)frames[i] - (uintptr_t)where.dli_fbase), where.dli_sname ? where.dli_sname : "?");
-        else
-            snprintf(line, sizeof(line), "  #%d %p\n", i, frames[i]);
-        ssize_t written_=write(2, line, strlen(line)); (void)written_;
-    }
-    _exit(128 + sig);
-}
-#endif
 #ifdef _WIN32
 /* Windows: one vectored handler takes the roles of the SIGSEGV handler. GPU page tracking
  * first, then the recovery point of a speculative guest memory read, then crash reports for
@@ -515,11 +464,13 @@ static int sfo_value(const char *path, const char *key, char *text, size_t text_
     if (n<20 || memcmp(data,"\0PSF",4)) return 0;
     uint32_t keys, values, count;
     memcpy(&keys,data+8,4); memcpy(&values,data+12,4); memcpy(&count,data+16,4);
-    for (uint32_t i=0;i<count && 20+i*16+16<=n;++i) {
+    for (uint32_t i=0;i<count && (uint64_t)20+i*16+16<=n;++i) {
         const unsigned char *e=data+20+i*16;
         uint16_t key_offset, format; uint32_t length, offset;
         memcpy(&key_offset,e,2); memcpy(&format,e+2,2); memcpy(&length,e+4,4); memcpy(&offset,e+12,4);
-        if (keys+key_offset>=n || values+offset+length>n || strcmp((const char *)data+keys+key_offset,key)) continue;
+        /* 64-bit sums: a malformed header must not wrap 32-bit offsets past the bounds check. */
+        if ((uint64_t)keys+key_offset>=n || (uint64_t)values+offset+length>n ||
+            strcmp((const char *)data+keys+key_offset,key)) continue;
         if (format==0x0404 && number && length>=4) { memcpy(number,data+values+offset,4); return 1; }
         if (text && text_size) {
             size_t copy=length<text_size-1 ? length : text_size-1;
@@ -553,6 +504,7 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
             if (!(relocs[r].target<offset+length && offset<relocs[r].target+8)) continue;
             uint64_t target=relocs[r].target, value;
             if (relocs[r].kind || target<offset || target+8>offset+length) fail("patch overlaps a relocation");
+            if (nslots==sizeof(slots)/sizeof(*slots)) fail("patch write overlaps too many relocations");
             memcpy(&value,data+(target-offset),8);
             if (value<base || !mapped(segments,ns,value-base,1)) fail("patch writes a pointer outside the image");
             slots[nslots++]=target;
@@ -684,12 +636,6 @@ int main(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-#ifndef _WIN32
-    /* Keep host heap objects handed to the guest (thread handles, TLS) in the
-       non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
-    mallopt(M_ARENA_MAX,1);
-    mallopt(M_MMAP_THRESHOLD,32*1024*1024);
-#endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
     int cpu_only = 0, strict_imports = 0;
     unsigned timeout_seconds = 10;
@@ -733,18 +679,6 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
     (void)timeout_seconds; /* no watchdog on Windows */
-#else
-    page_size = (size_t)sysconf(_SC_PAGESIZE);
-    struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
-    Dl_info self_info;
-    if (dladdr((void *)main,&self_info)) exe_base=(uintptr_t)self_info.dli_fbase;
-    struct sigaction dump = {0}; dump.sa_sigaction = thread_dump; dump.sa_flags = SA_SIGINFO|SA_RESTART;
-    sigemptyset(&dump.sa_mask); sigaction(SIGUSR2, &dump, NULL);
-    struct sigaction alarm_action = {0}; alarm_action.sa_sigaction = watchdog; alarm_action.sa_flags = SA_SIGINFO;
-    sigemptyset(&alarm_action.sa_mask); sigaction(SIGALRM, &alarm_action, NULL);
-    alarm(timeout_seconds); /* 0 disables the watchdog */
 #endif
     FILE *f = fopen(argv[1], "rb");
     if (!f) fail("cannot open boot file; run prepare.py first");
@@ -954,15 +888,7 @@ int main(int argc, char **argv) {
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
-#ifdef _WIN32
     typedef void (ABI *Entry)(void *, void (ABI *)(void));
     ((Entry)(image + entry))(&params, guest_exit);
-#else
-    /* The guest main thread runs on a stack below 1 TiB like PS4 stacks. */
-    enum { MAIN_STACK=8*1024*1024 };
-    unsigned char *stack=runtime_low_map(MAIN_STACK,PROT_READ|PROT_WRITE);
-    if (!stack) fail("cannot allocate guest main stack");
-    enter_on_stack(image+entry,&params,(void *)guest_exit,stack+MAIN_STACK-64);
-#endif
     fail("entry unexpectedly returned");
 }

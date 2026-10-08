@@ -104,8 +104,11 @@ def mod_files(folder):
             entries = list(scan)
         folders, files = [], []
         for entry in entries:
-            if entry.is_symlink():
-                raise ValueError(f'Mod symlinks are unsupported: {entry.path}')
+            # Junctions are directory symlinks under another name on Windows: is_symlink()
+            # stays False for them, so they must be refused separately or a mod could pull
+            # arbitrary local directories into the mounted game.
+            if entry.is_symlink() or (hasattr(entry, 'is_junction') and entry.is_junction()):
+                raise ValueError(f'Mod symlinks and junctions are unsupported: {entry.path}')
             (folders if entry.is_dir(follow_symlinks=False) else files).append(entry)
         for entry in sorted(files, key=lambda e: e.name):
             source = Path(entry.path)
@@ -293,13 +296,15 @@ def build_overlay(game, out, mods):
                 added += 1
             link(destination, source)
         print(f'Mods: {replaced} game files replaced, {added} added', file=sys.stderr)
-        # Windows' rename fails while any process (an antivirus scanning the fresh
-        # directory, a concurrent read) holds it; such holds are transient. Retry across
-        # a two-second window before falling back.
+        # os.rename fails on Windows whenever the target exists (WinError 183), not just
+        # while a process holds it — an earlier diagnosis as a purely transient antivirus
+        # hold was wrong, and retries could never succeed. os.replace is the POSIX-style
+        # atomic replace on both platforms; the retry only covers real transient holds
+        # (an antivirus scanning the fresh directory).
         renamed = False
         for attempt in range(10):
             try:
-                overlay.rename(cache)
+                overlay.replace(cache)
                 renamed = True
                 break
             except OSError:

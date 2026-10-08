@@ -99,9 +99,6 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
             uint64_t now=now_ns();
             *timeout=result ? 0 : (uint32_t)(now>=deadline ? 0 : (deadline-now)/1000);
         }
-#ifndef _WIN32
-        host_check(pthread_cond_destroy(&w.event));
-#endif
         if (!--s->active && s->deleted) free(s);
     }
     host_unlock(&lock);

@@ -34,7 +34,7 @@ bbport 将《血源诅咒》的 PlayStation 4 官方可执行文件直接运行�
 
 ## 系统需求
 
-- Windows 10 1803 或更新的 64 位系统，或 Linux x86-64。
+- Windows 10 1803 或更新的 64 位系统。
 - Vulkan 1.3 显卡。DLSS 需要 NVIDIA RTX 显卡；FSR 4/4.1.1 需要相应 shader 特性，FSR 4.1.1 另需 VK_VALVE_shader_mixed_float_dot_product 扩展。
 - 游戏目录：任一区服的 1.09 版 dump，含 eboot.bin 与 sce_module，如 CUSA03173、CUSA03023、CUSA00900。
 - 帧率解锁与渲染分辨率预设所需的社区补丁 XML（见"Mod 与补丁"）——必装，缺失时启动直接失败。
@@ -159,14 +159,8 @@ AI 辅助安装（给 AI 助手照着做的配置清单）见 [docs/AI-SETUP.md]
 
 ## Linux 版
 
-原始 Linux 版继续受支持：
-
-```
-bash build.sh
-BB_GAME_DIR=/path/to/CUSA03173 bash run.sh
-```
-
-GTK4 启动器、AppImage 打包与 Steam Deck 细节见 launcher\、packaging\ 与 docs\。
+原始 Linux 版已随 windows-port 分支移除；需要 Linux 支持请使用上游镜像
+[yumlevi/bloodborne_pc](https://github.com/yumlevi/bloodborne_pc)。
 
 ## 仓库结构
 

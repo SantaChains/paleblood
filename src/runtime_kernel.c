@@ -11,10 +11,6 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <x86intrin.h>
-#ifndef _WIN32
-#include <sys/random.h>
-#include <sys/resource.h>
-#endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define PAGE 16384
 
@@ -196,17 +192,10 @@ typedef struct { GuestTimeval utime, stime; int64_t rest[14]; } GuestRusage;
 static ABI int32_t guest_getrusage(int who,GuestRusage *out) {
     if (!out || (who!=0 && who!=1)) return fail_posix(EINVAL);
     memset(out,0,sizeof(*out));
-#ifdef _WIN32
     int64_t user,system;
     runtime_cpu_times(who==1,&user,&system);
     out->utime=(GuestTimeval){user/1000000,user%1000000};
     out->stime=(GuestTimeval){system/1000000,system%1000000};
-#else
-    struct rusage r;
-    getrusage(who==0 ? RUSAGE_SELF : RUSAGE_THREAD,&r);
-    out->utime=(GuestTimeval){r.ru_utime.tv_sec,r.ru_utime.tv_usec};
-    out->stime=(GuestTimeval){r.ru_stime.tv_sec,r.ru_stime.tv_usec};
-#endif
     return 0;
 }
 static ABI int32_t guest_sysctl(const int32_t *name,uint32_t namelen,void *old,uint64_t *oldlen,const void *new_value,uint64_t newlen) {
@@ -214,11 +203,7 @@ static ABI int32_t guest_sysctl(const int32_t *name,uint32_t namelen,void *old,u
     if (!name || namelen<2 || new_value) return fail_posix(EINVAL);
     if (name[0]==1 && name[1]==37) { /* kern.arandom */
         if (!old || !oldlen) return fail_posix(EINVAL);
-#ifdef _WIN32
         if (runtime_random(old,(size_t)*oldlen)<0) return fail_posix(errno);
-#else
-        if (getrandom(old,(size_t)*oldlen,0)<0) return fail_posix(errno);
-#endif
         return 0;
     }
     if (name[0]==6 && (name[1]==7 || name[1]==3)) { /* hw.pagesize / hw.ncpu */

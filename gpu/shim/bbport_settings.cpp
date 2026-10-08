@@ -15,9 +15,54 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h> // MoveFileExA: UCRT rename() fails with EEXIST on an existing target
+#endif
+
 namespace BbSettings {
 
 namespace {
+
+// CollapsingHeader open states, keyed by section label. Lives here rather than in Values:
+// menu layout is not runtime state, and most readers take Values as a const reference, which
+// could not carry a mutex. Guarded for the whole life of the process because the menu runs on
+// the present thread while Save() can run on a detached thread at the same time.
+std::mutex collapse_mutex;
+std::vector<std::pair<std::string, bool>> collapse_states;
+
+/// Adds or updates one entry; true when the stored state actually changed.
+bool RecordCollapse(const std::string& label, bool open) {
+    const std::scoped_lock lock{collapse_mutex};
+    for (auto& [name, value] : collapse_states) {
+        if (name == label) {
+            if (value == open) {
+                return false;
+            }
+            value = open;
+            return true;
+        }
+    }
+    collapse_states.emplace_back(label, open);
+    return true;
+}
+
+/// Removes an entry (the header is back at its default, so the key must not survive into the
+/// next save as a remembered choice); true when something was removed.
+bool ForgetCollapseEntry(const std::string& label) {
+    const std::scoped_lock lock{collapse_mutex};
+    for (auto it = collapse_states.begin(); it != collapse_states.end(); ++it) {
+        if (it->first == label) {
+            collapse_states.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+void ResetCollapseStates() {
+    const std::scoped_lock lock{collapse_mutex};
+    collapse_states.clear();
+}
 
 const char* Path() {
     const char* env = std::getenv("BB_CONFIG");
@@ -166,6 +211,11 @@ void Set(Values& v, const std::string& key, const std::string& value) {
                 v.output_res = r;
             }
         }
+    } else if (key.rfind("collapse_", 0) == 0) {
+        // CollapsingHeader states ride along in the same file, one key per section. The label
+        // is the key tail verbatim, so a section keeps its state across restarts without the
+        // menu needing a table of its own on disk.
+        RecordCollapse(key.substr(9), i != 0);
     } else {
         for (int e = 0; e < EffectCount; ++e) {
             if (key == Effects[e].key) {
@@ -195,6 +245,9 @@ std::string DataDir() {
 
 void Load() {
     auto& v = Get();
+    // Load() is only called once per process today, but clearing makes a second call well
+    // defined instead of doubling every remembered section.
+    ResetCollapseStates();
     for (int e = 0; e < EffectCount; ++e) {
         v.effects[e] = Effects[e].default_on;
     }
@@ -324,9 +377,9 @@ void Save() {
                 continue;
             }
             const std::string key = text.substr(0, eq);
-            bool known = false;
-            for (const char* o : owned) {
-                known = known || key == o;
+            bool known = key.rfind("collapse_", 0) == 0;
+            for (int o = 0; o < int(sizeof(owned) / sizeof(owned[0])) && !known; ++o) {
+                known = key == owned[o];
             }
             for (int e = 0; e < EffectCount && !known; ++e) {
                 known = key == Effects[e].key;
@@ -397,6 +450,15 @@ void Save() {
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");
+    // CollapsingHeader states. Keys are section labels verbatim: they may contain '=' or
+    // spaces, both harmless here because Load() splits on the first '=' only and the tail is
+    // compared as a whole string.
+    {
+        const std::scoped_lock lock{collapse_mutex};
+        for (const auto& [name, open] : collapse_states) {
+            std::fprintf(file, "collapse_%s=%d\n", name.c_str(), open ? 1 : 0);
+        }
+    }
     for (const std::string& kept : foreign) {
         std::fprintf(file, "%s\n", kept.c_str());
     }
@@ -409,14 +471,26 @@ void Save() {
         return;
     }
     std::fclose(file);
-    // Windows' rename fails when any process holds the target open (antivirus/indexer/
-    // launcher reads are transient, usually well under a second), where POSIX replaces
-    // atomically regardless. Retry across a one-second window before giving up; giving up
-    // is safe — the target is untouched, only this save's values are not persisted.
-    bool replaced = std::rename(tmp.c_str(), target.c_str()) == 0;
+    // Replace the target with the temporary. On POSIX rename() is atomic and replaces
+    // unconditionally. UCRT's rename() is neither: it FAILS with EEXIST when the target
+    // exists, so every save after the first one silently failed (the log filled with
+    // "cannot replace ... File exists"). MoveFileEx with MOVEFILE_REPLACE_EXISTING is the
+    // Windows equivalent; it still fails while another process holds the target open
+    // (antivirus/indexer reads are transient), hence the retry window. Giving up is safe —
+    // the target is untouched, only this save's values are not persisted.
+#ifdef _WIN32
+    const auto replace = [](const char* from, const char* to) {
+        return MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    };
+#else
+    const auto replace = [](const char* from, const char* to) {
+        return std::rename(from, to) == 0;
+    };
+#endif
+    bool replaced = replace(tmp.c_str(), target.c_str());
     for (int attempt = 0; !replaced && attempt < 10; ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        replaced = std::rename(tmp.c_str(), target.c_str()) == 0;
+        replaced = replace(tmp.c_str(), target.c_str());
     }
     if (!replaced) {
         std::printf("Settings: cannot replace %s: %s\n", target.c_str(),
@@ -440,6 +514,24 @@ const char* UpscalerName(int upscaler) {
     static constexpr const char* names[UpscalerCount] = {"off", "fsr3", "fsr4", "fsr411", "taa",
                                                                   "dlss"};
     return names[std::clamp(upscaler, 0, UpscalerCount - 1)];
+}
+
+bool CollapseOpen(const std::string& label, bool default_open) {
+    const std::scoped_lock lock{collapse_mutex};
+    for (const auto& [name, value] : collapse_states) {
+        if (name == label) {
+            return value;
+        }
+    }
+    return default_open;
+}
+
+bool SetCollapseOpen(const std::string& label, bool open) {
+    return RecordCollapse(label, open);
+}
+
+bool ForgetCollapse(const std::string& label) {
+    return ForgetCollapseEntry(label);
 }
 
 } // namespace BbSettings

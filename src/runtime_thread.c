@@ -112,9 +112,6 @@ GuestThread *runtime_thread_current(void) {
     if (current) return current;
     GuestThread *t=new_thread();
     if (!t) { fputs("Cannot allocate guest thread\n",stderr); exit(1); }
-#ifndef _WIN32
-    t->host=pthread_self();
-#endif
     t->host_owned=1;
     snprintf(t->name,sizeof(t->name),"host");
     attach(t); publish(t);
@@ -136,6 +133,12 @@ static GuestThread *find_thread(void *handle) {
     for (GuestThread *t=threads;t;t=t->next) if (t==handle) { found=t; break; }
     host_unlock(&lock);
     return found;
+}
+/* Lockless membership probe for sections that already hold the lock: records are freed
+ * on reap, so the membership test and the state check must share one lock section. */
+static int thread_listed(const GuestThread *t) {
+    for (const GuestThread *it=threads;it;it=it->next) if (it==t) return 1;
+    return 0;
 }
 static ThreadAttr *find_attr(ThreadAttr **slot) {
     if (!slot || !*slot) return NULL;
@@ -282,12 +285,12 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     pthread_attr_destroy(&host);
 #endif
     if (e) { fprintf(stderr,"STOP: host thread creation failed: %d\n",e); exit(21); }
-    /* The initial detach for a detached attr claims the flag under the lock, same as
-     * thread_detach: published handles are reachable now, so the claim is what prevents the
-     * creator's detach and a concurrent guest detach from both hitting the host handle. */
+    /* A detached-attr thread is born claimed (detached=1 from the attr above), which also
+     * refuses guest detach/join at the gate, so exactly one initial host detach happens
+     * here. Joinable threads keep detached=0: join and detach stay legal as on POSIX. */
     int initial_detached;
     host_lock(&lock);
-    initial_detached=t->detached; t->detached=1;
+    initial_detached=t->detached;
     host_unlock(&lock);
     if (initial_detached) host_thread_detach(t->host);
     host_lock(&lock); ++created; host_unlock(&lock);
@@ -298,7 +301,7 @@ static ABI int32_t thread_create(GuestThread **out,ThreadAttr **attr,GuestEntry 
     return create(out,attr,entry,argument,name);
 }
 static ABI int32_t thread_join(GuestThread *t,void **result) {
-    if (!find_thread(t) || t->host_owned) return ERR(3);
+    if (!t) return ERR(3);
     if (t==current) return ERR(11);
     /* Claim the join under the lock, then join outside it: two guest threads joining the
      * same target would otherwise both pass the check and call host_thread_join twice —
@@ -307,21 +310,38 @@ static ABI int32_t thread_join(GuestThread *t,void **result) {
      * safe. Joining while holding the lock itself would deadlock: the target thread takes
      * the same lock to mark itself finished. */
     host_lock(&lock);
+    const int listed=thread_listed(t);
+    if (!listed) { host_unlock(&lock); return ERR(3); }
+    if (t->host_owned) { host_unlock(&lock); return ERR(3); }
     if (t->detached || t->joined) { host_unlock(&lock); return ERR(22); }
     t->joined=1;
     host_unlock(&lock);
     int e=host_thread_join(t->host);
     if (e) { fprintf(stderr,"STOP: host thread join failed: %d\n",e); exit(21); }
     if (result) *result=t->result;
-    host_lock(&lock); ++joined_count; host_unlock(&lock);
+    /* Reap: unlink first so any later handle dereference through find_thread returns
+     * ESRCH, then release the TLS block and the record itself (joined once, unreferenced). */
+    host_lock(&lock);
+    for (GuestThread **p=&threads;*p;p=&(*p)->next) if (*p==t) { *p=t->next; break; }
+    ++joined_count;
+    host_unlock(&lock);
+#ifdef _WIN32
+    if (t->tls_block) _aligned_free(t->tls_block);
+#else
+    free(t->tls_block);
+#endif
+    free(t);
     return 0;
 }
 static ABI int32_t thread_detach(GuestThread *t) {
-    if (!find_thread(t)) return ERR(3);
-    /* Same claim discipline as thread_join: refused once a join has been claimed (the host
-     * handle is about to be reaped), and double-detach becomes a clean EINVAL instead of a
-     * second host_thread_detach on the same handle. */
+    if (!t) return ERR(3);
+    /* Same claim discipline as thread_join, with membership and state validated in one
+     * locked section (records are freed on reap): refused once a join has been claimed
+     * (the host handle is about to be reaped), and double-detach becomes a clean EINVAL
+     * instead of a second host_thread_detach on the same handle. */
     host_lock(&lock);
+    const int listed=thread_listed(t);
+    if (!listed) { host_unlock(&lock); return ERR(3); }
     if (t->detached || t->joined) { host_unlock(&lock); return ERR(22); }
     t->detached=1;
     host_unlock(&lock);

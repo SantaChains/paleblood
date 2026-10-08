@@ -15,7 +15,6 @@ typedef CONDITION_VARIABLE NativeCond;
 static int native_init(NativeMutex *m, int type) {
     InitializeSRWLock(&m->lock); m->owner = 0; m->depth = 0; m->type = type; return 0;
 }
-static int native_destroy(NativeMutex *m) { return __atomic_load_n(&m->owner, __ATOMIC_RELAXED) ? EBUSY : 0; }
 static DWORD owner(const NativeMutex *m) { return __atomic_load_n(&m->owner, __ATOMIC_RELAXED); }
 static void take(NativeMutex *m, DWORD self) { __atomic_store_n(&m->owner, self, __ATOMIC_RELAXED); m->depth = 1; }
 /* Relocking by the owner: recursion, an error, or (normal type) a deadlock as on POSIX. */
@@ -57,7 +56,6 @@ static int native_unlock(NativeMutex *m) {
     return 0;
 }
 static int native_cond_init(NativeCond *c) { InitializeConditionVariable(c); return 0; }
-static int native_cond_destroy(NativeCond *c) { (void)c; return 0; }
 /* deadline: realtime nanoseconds, 0 for none. The wait gives up the whole recursion. */
 static int native_cond_wait(NativeCond *c, NativeMutex *m, uint64_t deadline) {
     DWORD self = GetCurrentThreadId(), ms = INFINITE;
@@ -91,7 +89,6 @@ static int native_init(NativeMutex *m, int type) {
     pthread_mutexattr_destroy(&attr);
     return e;
 }
-static int native_destroy(NativeMutex *m) { return pthread_mutex_destroy(m); }
 static int native_lock(NativeMutex *m) { return pthread_mutex_lock(m); }
 static int native_trylock(NativeMutex *m) { return pthread_mutex_trylock(m); }
 static struct timespec realtime(uint64_t ns) { return (struct timespec){(time_t)(ns / 1000000000), (long)(ns % 1000000000)}; }
@@ -101,7 +98,6 @@ static int native_timedlock(NativeMutex *m, uint64_t deadline) {
 }
 static int native_unlock(NativeMutex *m) { return pthread_mutex_unlock(m); }
 static int native_cond_init(NativeCond *c) { return pthread_cond_init(c, NULL); }
-static int native_cond_destroy(NativeCond *c) { return pthread_cond_destroy(c); }
 static int native_cond_wait(NativeCond *c, NativeMutex *m, uint64_t deadline) {
     if (!deadline) return pthread_cond_wait(c, m);
     struct timespec end = realtime(deadline);
@@ -143,13 +139,13 @@ static ABI int32_t attr_protocol(GuestAttr **attr, int protocol) {
     return 0;
 }
 static ABI int32_t attr_destroy(GuestAttr **attr) {
-    if (!attr || !*attr) return orbis_error(EINVAL);
-    free(*attr); *attr = NULL; return 0;
+    if (!attr) return orbis_error(EINVAL);
+    *attr = NULL; return 0;
 }
 static ABI int32_t mutex_init(GuestMutex **out, GuestAttr **attr, const char *name) {
     (void)name;
-    if (!out || (attr && !*attr)) return orbis_error(EINVAL);
-    int type = attr ? (*attr)->type : 1;
+    if (!out) return orbis_error(EINVAL);
+    int type = attr && *attr ? (*attr)->type : 1;
     if (type < 1 || type > 4) return orbis_error(EINVAL);
     GuestMutex *mutex = malloc(sizeof(*mutex));
     if (!mutex) return orbis_error(ENOMEM);
@@ -162,7 +158,6 @@ static HostMutex static_init = HOST_MUTEX_INIT;
 static int32_t ensure_mutex(GuestMutex **mutex) {
     if (!mutex) return orbis_error(EINVAL);
     uintptr_t value = __atomic_load_n((uintptr_t *)mutex, __ATOMIC_ACQUIRE);
-    if (value == 2) return orbis_error(EINVAL);
     if (value >= 2) return 0;
     host_lock(&static_init);
     int32_t e = 0;
@@ -189,18 +184,20 @@ static ABI int32_t mutex_trylock(GuestMutex **mutex) {
     return e;
 }
 static ABI int32_t mutex_unlock(GuestMutex **mutex) {
-    if (!mutex || (uintptr_t)*mutex == 2) return orbis_error(EINVAL);
+    if (!mutex) return orbis_error(EINVAL);
     if ((uintptr_t)*mutex < 2) return orbis_error(EPERM);
     int32_t e = orbis_error(native_unlock(&(*mutex)->native));
     if (!e) ++unlocks;
     return e;
 }
+/* FreeBSD semantics: destroy clears the handle and succeeds unconditionally — the game's
+ * "destroy only when set" guards rely on the handle being cleared, and destroying twice
+ * must not fail. The native object is never freed: another thread may still hold the
+ * pointer during teardown, and a small leak is safer than use-after-free. */
 static ABI int32_t mutex_destroy(GuestMutex **mutex) {
-    if (!mutex || (uintptr_t)*mutex == 2) return orbis_error(EINVAL);
-    if ((uintptr_t)*mutex < 2) return 0;
-    int e = native_destroy(&(*mutex)->native);
-    if (!e) { free(*mutex); *mutex = (GuestMutex *)(uintptr_t)2; }
-    return orbis_error(e);
+    if (!mutex) return orbis_error(EINVAL);
+    __atomic_store_n((uintptr_t *)mutex, 0, __ATOMIC_RELEASE);
+    return 0;
 }
 /* Deadlines are realtime nanoseconds (FreeBSD's default condition variable clock). */
 static uint64_t deadline_after(uint64_t usec) { return host_realtime_ns() + usec * 1000; }
@@ -240,10 +237,8 @@ static int32_t ensure_cond(GuestCond **cond) {
 }
 static ABI int32_t cond_destroy(GuestCond **cond) {
     if (!cond) return orbis_error(EINVAL);
-    if ((uintptr_t)*cond < 2) return 0;
-    int e = native_cond_destroy(&(*cond)->native);
-    if (!e) { free(*cond); *cond = NULL; }
-    return orbis_error(e);
+    __atomic_store_n((uintptr_t *)cond, 0, __ATOMIC_RELEASE);
+    return 0;
 }
 static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
     int32_t e = ensure_cond(cond);

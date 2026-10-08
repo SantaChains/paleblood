@@ -238,15 +238,17 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     if (result != VK_SUCCESS) [[unlikely]] {
         // Resizes can land while VRAM is over the driver's budget (streaming pressure plus a
         // new frame image). WITHIN_BUDGET makes VMA refuse rather than let the driver evict
-        // others: fall back to an over-subscribed allocation, then give the driver a moment.
+        // others: fall back to an over-subscribed allocation, then give the driver time.
+        // Windows (WDDM) releases a killed process's VRAM asynchronously and real-time
+        // scanners transiently hold allocations, so the window has to cover seconds, not
+        // the original 3 retries over ~60 ms — a launch right after a forced kill could
+        // then exhaust it and abort ("flash crash").
         LOG_WARNING(Render_Vulkan, "Frame image allocation failed ({}), retrying over budget",
                     vk::to_string(vk::Result{result}));
         VmaAllocationCreateInfo retry_info = alloc_info;
         retry_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            if (attempt > 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(20 * attempt));
-            }
+        for (int attempt = 1; attempt <= 10; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50 * attempt));
             result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &retry_info,
                                     &unsafe_image, &frame->allocation, nullptr);
             if (result == VK_SUCCESS) {
@@ -254,7 +256,14 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
             }
         }
         if (result != VK_SUCCESS) [[unlikely]] {
-            LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}",
+            // Not an invariant violation: allocation failure is a runtime condition (driver
+            // pressure, a preceding killed process still being cleaned up). There is no way
+            // to present without a frame image, so the process must stop — but say so in
+            // terms the user can act on instead of tripping the unreachable-code path.
+            LOG_CRITICAL(Render_Vulkan,
+                         "Frame image allocation failed after retries ({}); the driver could "
+                         "not serve VRAM for several seconds. Start the game again — a "
+                         "restart right after another instance was killed is the usual cause.",
                          vk::to_string(vk::Result{result}));
             UNREACHABLE();
         }
