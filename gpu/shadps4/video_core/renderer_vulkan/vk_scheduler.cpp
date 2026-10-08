@@ -25,6 +25,10 @@
 
 namespace Vulkan {
 
+// Declared in vk_pipeline_cache.cpp; read here only for the device-lost diagnostic dump.
+extern std::atomic<u64> g_bb_compile_ns;
+extern std::atomic<u32> g_bb_compiles;
+
 std::mutex Scheduler::submit_mutex;
 
 Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
@@ -453,6 +457,24 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        // The assert aborts: dump everything that discriminates the known device-lost
+        // hypotheses (memory-pressure churn vs invalid command contents vs TDR) while the
+        // process can still write. std::printf goes through the launcher's unbuffered stderr.
+        const auto mem = instance.GetDeviceMemoryStatus();
+        const u32 compiles = Vulkan::g_bb_compiles.load(std::memory_order_relaxed);
+        std::printf(
+            "Device lost diagnostics: memory usage {:.1f} MB / budget {:.1f} MB, "
+            "compiles pending {}, shader compile total {:.1f} ms, draw {}, dispatch {}, "
+            "tick wait total {:.1f} ms, host copies wait total {:.1f} ms\n",
+            mem.usage / 1e6, mem.budget / 1e6, compiles,
+            Vulkan::g_bb_compile_ns.load(std::memory_order_relaxed) / 1e6,
+            BbStats::draws.load(std::memory_order_relaxed),
+            BbStats::dispatches.load(std::memory_order_relaxed),
+            BbStats::tick_wait_ns.load(std::memory_order_relaxed) / 1e6,
+            BbStats::host_copies_wait_ns.load(std::memory_order_relaxed) / 1e6);
+        std::fflush(stdout);
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     work_semaphore.Refresh();
