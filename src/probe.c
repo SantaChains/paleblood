@@ -102,6 +102,7 @@ static ABI void guest_exit(void) { puts("Runtime: process finalizer callback rea
  * faults in guest code (it has no unwind data, so frame-based handlers cannot see it). */
 static unsigned char *traps_base;
 static size_t traps_size, image_size;
+#define CHEAT_SCRATCH_SIZE ((size_t)1 << 20) /* 1 MiB: slot offsets seen so far reach 0x4000 */
 static uintptr_t scratch_base; /* cheat scratch page (image tail), see the protect pass */
 static Segment *cheat_segments; /* for runtime_cheat_write: the loader's segment table */
 static uint64_t cheat_ns;
@@ -797,8 +798,13 @@ int main(int argc, char **argv) {
         }
     }
     cheat_segments = segments; cheat_ns = ns; /* runtime cheat writes validate against these */
-    /* One trailing page becomes the cheat scratch area (see the protect pass below). */
-    image = allocate(round_page(size) + page_size);
+    /* One 1 MiB tail region becomes the cheat scratch area (see the protect pass below);
+     * the slot offsets chosen by patch authors reach at least 0x4000, so the area must
+     * span well beyond one page. */
+    image = allocate(round_page(size) + CHEAT_SCRATCH_SIZE);
+    /* Registered before runtime_cheats_boot so its load_state can verify each json's
+     * bbport_scratch against the live base — a stale out/ tree is rejected up front. */
+    bbcheats_set_scratch((uintptr_t)image + round_page(size));
 #ifdef _WIN32
     image_size = round_page(size);
 #endif
@@ -870,8 +876,7 @@ int main(int argc, char **argv) {
      * image head is NOT usable for this: the first module is laid out from offset 0
      * (entry at 0xa0), so low offsets sit inside the executable code segment. */
     scratch_base = (uintptr_t)image + round_page(size);
-    protect(image + round_page(size), page_size, 2);
-    bbcheats_set_scratch(scratch_base);
+    protect(image + round_page(size), CHEAT_SCRATCH_SIZE, 2);
     int executable_entry = 0;
     for (uint64_t i = 0; i < ns; ++i) {
         protect(image + segments[i].address, round_page(segments[i].size), (unsigned)segments[i].flags);

@@ -44,6 +44,7 @@ from pathlib import Path
 PS4_EBOOT_BASE = 0x400000
 LOW_MIN = 0x0800000000
 PAGE = 0x1000
+SCRATCH_SIZE = 0x100000  # must match CHEAT_SCRATCH_SIZE in probe.c
 MOFFS_OPS = {0xA0, 0xA1, 0xA2, 0xA3}
 
 
@@ -68,7 +69,7 @@ def relocate_bytes(hex_str: str, patch_offset: int, image_base: int, scratch_bas
     for i in range(1, len(data) - 7):
         if data[i - 1] in MOFFS_OPS or (i >= 2 and data[i - 2] in MOFFS_OPS):
             target = int.from_bytes(data[i:i + 8], 'little')
-            if 0 < target < PS4_EBOOT_BASE:
+            if 0 < target < SCRATCH_SIZE:
                 out[i:i + 8] = (scratch_base + target).to_bytes(8, 'little')
                 relocated += 1
 
@@ -76,7 +77,7 @@ def relocate_bytes(hex_str: str, patch_offset: int, image_base: int, scratch_bas
     for i in range(len(data) - 3):
         rip_after = PS4_EBOOT_BASE + patch_offset + i + 4
         target = s32(int.from_bytes(data[i:i + 4], 'little')) + rip_after
-        if 0 < target < PS4_EBOOT_BASE:
+        if 0 < target < SCRATCH_SIZE:
             new_disp = (scratch_base + target) - (image_base + patch_offset + i + 4)
             if not -(1 << 31) <= new_disp < (1 << 31):
                 raise SystemExit(
@@ -118,10 +119,19 @@ def main() -> int:
     args = ap.parse_args()
 
     boot = Path(args.boot_image)
-    if not boot.is_file():
+    if not boot.is_file() or boot.stat().st_size < 64:
         print(f'relocate_cheats: {boot} missing — run the prepare step first', file=sys.stderr)
         return 1
-    scratch_base = LOW_MIN + round_page(boot.stat().st_size)
+    # The scratch base follows the *image* size, not the file size: a BBPROBE2 file is
+    # [magic 8s][size entry ns nr ni flags 6Q][segment/import/reloc tables][image data],
+    # and the loader allocates round_page(size) + one scratch page from that field.
+    with boot.open('rb') as f:
+        head = f.read(64)
+    if head[:7] != b'BBPROBE':
+        print(f'relocate_cheats: {boot} is not a BBPROBE image', file=sys.stderr)
+        return 1
+    image_size = int.from_bytes(head[8:16], 'little')
+    scratch_base = LOW_MIN + round_page(image_size)
 
     src = Path(args.cheats_dir)
     dst = Path(args.out)
