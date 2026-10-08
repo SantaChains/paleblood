@@ -7,7 +7,9 @@ bbport runs the official PlayStation 4 executable of *Bloodborne* directly on x8
 The `windows-port` branch is the native Windows version; it adds NVIDIA DLSS upscaling, an in-game cheat engine, full gamepad support and Chinese text on top of the original Linux version.
 
 ![1791450736372](image/README/1791450736372.png)
+![1791462305761](image/README/1791462305761.png)
 ![1791453053350](image/README/1791453053350.png)
+![1791462405668](image/README/1791462405668.png)
 
 ## Disclaimer
 
