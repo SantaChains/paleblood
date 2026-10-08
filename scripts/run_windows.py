@@ -151,10 +151,13 @@ def main():
     # (language: PS4 system language, 11 = simplified Chinese; pad_swap: swap A/B and X/Y
     # for pads reporting the Nintendo layout; gc_budget_mb: texture cache budget;
     # gc_writeback: synchronous write-backs per GC pass under pressure;
-    # present_mode: Mailbox (default) / Fifo (VSync, use with VRR) / Immediate).
+    # present_mode: Mailbox (default) / Fifo (VSync, use with VRR) / Immediate);
+    # fps: FPS patch preset, one of 30/60/90/uncap (default uncap; the in-game fps_cap
+    # frame limiter is a separate key).
     # gc_writeback is the key bbport_settings.cpp parses; the older gc_downloads spelling is
     # still accepted below so an existing ini keeps working.
     for key, var in (('language', 'BB_LANGUAGE'), ('pad_swap', 'BB_PAD_SWAP'),
+                     ('fps', 'BB_FPS'),
                      ('gc_budget_mb', 'BB_GC_BUDGET_MB'),
                      ('gc_writeback', 'BB_GC_DOWNLOADS_PER_PASS'),
                      ('gc_downloads', 'BB_GC_DOWNLOADS_PER_PASS'),

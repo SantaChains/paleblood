@@ -247,8 +247,10 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
                     vk::to_string(vk::Result{result}));
         VmaAllocationCreateInfo retry_info = alloc_info;
         retry_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-        for (int attempt = 1; attempt <= 10; ++attempt) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50 * attempt));
+        for (int attempt = 1; attempt <= 20; ++attempt) {
+            // 50 ms growth capped at 500 ms: ~8 s in total, wide enough for a preceding
+            // instance's asynchronous VRAM release (WDDM teardown, scanner transients).
+            std::this_thread::sleep_for(std::chrono::milliseconds(50 * attempt < 500 ? 50 * attempt : 500));
             result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &retry_info,
                                     &unsafe_image, &frame->allocation, nullptr);
             if (result == VK_SUCCESS) {
