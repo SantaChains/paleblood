@@ -498,13 +498,38 @@ void VideoOutDriver::Flip(const Request& req) {
             // registrations and upload bytes track scene transitions and streaming.
             // Window-level deltas (the per-frame ones would show just the last frame).
             static u64 window_images, window_image_bytes, window_buffer_bytes;
-            std::printf("Scene: %llu new images, %.0f MB texture uploads, %.0f MB buffer uploads\n",
+            std::printf("Scene: %llu new images, %.0f MB texture uploads, %.0f MB buffer uploads; "
+                        "%llu refreshes, detile %.1f ms, upload %.1f ms\n",
                         static_cast<unsigned long long>(images - window_images),
                         (image_bytes - window_image_bytes) / 1e6,
-                        (buffer_bytes - window_buffer_bytes) / 1e6);
+                        (buffer_bytes - window_buffer_bytes) / 1e6,
+                        static_cast<unsigned long long>(BbStats::refresh_count.exchange(0)),
+                        BbStats::t_refresh_detile.exchange(0) / 1e6,
+                        BbStats::t_refresh_upload.exchange(0) / 1e6);
             window_images = images;
             window_image_bytes = image_bytes;
             window_buffer_bytes = buffer_bytes;
+            // Top refresh consumers: which images eat the repeat-upload budget.
+            for (int i = 0; i < 8; ++i) {
+                const u64 addr = BbStats::refresh_top_addr[i].exchange(0);
+                const u64 bytes = BbStats::refresh_top_bytes[i].exchange(0);
+                const u64 hits = BbStats::refresh_top_count[i].exchange(0);
+                if (addr && bytes) {
+                    std::printf("  refresh top: addr %llx, %llu uploads, %.1f MB\n",
+                                static_cast<unsigned long long>(addr),
+                                static_cast<unsigned long long>(hits), bytes / 1e6);
+                }
+            }
+            // Chunk-change probe: the go/no-go datum for incremental texture uploads.
+            const u64 total = BbStats::probe_chunks_total.exchange(0);
+            if (total) {
+                const u64 changed = BbStats::probe_chunks_changed.exchange(0);
+                std::printf("  probe: %llu/%llu 64KiB chunks changed (%.1f%%) — "
+                            "incremental upload would move that fraction\n",
+                            static_cast<unsigned long long>(changed),
+                            static_cast<unsigned long long>(total),
+                            100.0 * changed / total);
+            }
             // Wave budget: where the sub-stall slow frames spent their time (same
             // seven segments as the Stall dump, averaged over the slow frames — the
             // deltas were captured per frame, so consecutive slow frames attribute

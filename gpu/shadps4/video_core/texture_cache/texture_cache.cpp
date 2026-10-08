@@ -3,6 +3,7 @@
 
 #include <xxhash.h>
 
+#include <cstdlib>
 #include <unordered_set>
 
 #include "bbport_memory_hash.h"
@@ -901,7 +902,6 @@ void TextureCache::RefreshImage(Image& image) {
 
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
-    const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
     BbStats::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
@@ -922,7 +922,15 @@ void TextureCache::RefreshImage(Image& image) {
         // character creation preview went black after one frame).
         const u64 mip_hash =
             BbMemory::HashBacking(image.info.guest_address + mip_offset, mip_size);
-        if (is_gpu_modified && !is_gpu_dirty && image.mip_hashes[m] == mip_hash) {
+        // bbport: a CPU write whose value equals what was last uploaded changes nothing
+        // the GPU can see — the water surface's animated parameters rewrite the same
+        // bytes every frame (measured: 0/12096 64 KiB chunks changed across windows),
+        // and each write fault marked the 11.4 MB image CpuDirty for a full re-upload.
+        // The per-mip hash is that check, unconditionally: equal bytes mean the copy
+        // carries no information, and when the GPU also wrote this image (its compute
+        // pass re-generates the water surface every frame, setting GpuDirty) keeping
+        // the GPU's version is exactly what the equality allows.
+        if (image.mip_hashes[m] == mip_hash) {
             continue;
         }
         image.mip_hashes[m] = mip_hash;
@@ -953,12 +961,87 @@ void TextureCache::RefreshImage(Image& image) {
 
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
-    const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
-    for (auto& copy : image_copies) {
-        copy.bufferOffset += offset;
+    std::pair<const Buffer*, u64> detiled{in_buffer, in_offset};
+    {
+        BbStats::Timer timer{BbStats::t_refresh_detile};
+        detiled = tile_manager.DetileImage(in_buffer, in_offset, image.info);
+        for (auto& copy : image_copies) {
+            copy.bufferOffset += detiled.second;
+        }
     }
-
-    runtime.UploadImage(&image, buffer, image_copies);
+    {
+        BbStats::Timer timer{BbStats::t_refresh_upload};
+        runtime.UploadImage(&image, detiled.first, image_copies);
+    }
+    BbStats::refresh_count.fetch_add(1, std::memory_order_relaxed);
+    // Attribute the upload to its image: the top table survives across windows until
+    // the summary clears it, so a pathological repeat uploader (the 4+ GB/5 s class)
+    // shows up by address even when no single window alone would rank it.
+    const u64 top_addr = image.info.guest_address;
+    int empty = -1, smallest = 0;
+    for (int i = 0; i < 8; ++i) {
+        const u64 slot_addr = BbStats::refresh_top_addr[i].load(std::memory_order_relaxed);
+        if (slot_addr == top_addr) {
+            BbStats::refresh_top_bytes[i].fetch_add(image.info.guest_size,
+                                                    std::memory_order_relaxed);
+            BbStats::refresh_top_count[i].fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+        if (!slot_addr && empty < 0) {
+            empty = i;
+        }
+        if (BbStats::refresh_top_bytes[i].load(std::memory_order_relaxed) <
+            BbStats::refresh_top_bytes[smallest].load(std::memory_order_relaxed)) {
+            smallest = i;
+        }
+    }
+    if (empty < 0) {
+        empty = smallest; // table full: displace the smallest consumer
+    }
+    u64 expected = 0;
+    if (BbStats::refresh_top_addr[empty].compare_exchange_strong(expected, top_addr,
+                                                                 std::memory_order_relaxed)) {
+        BbStats::refresh_top_bytes[empty].store(image.info.guest_size,
+                                                std::memory_order_relaxed);
+        BbStats::refresh_top_count[empty].store(1, std::memory_order_relaxed);
+    }
+    // Chunk-change probe (BB_PROBE_CHUNKS=1, one-shot): for the address that dominates
+    // the refresh budget, hash 64 KiB blocks and count how many changed since the last
+    // refresh. The changed ratio is the go/no-go datum for incremental uploads.
+    static std::atomic<int> probe_enabled{-1};
+    if (probe_enabled.load(std::memory_order_relaxed) < 0) {
+        probe_enabled.store(getenv("BB_PROBE_CHUNKS") ? 1 : 0, std::memory_order_relaxed);
+    }
+    constexpr u64 kChunk = 64 << 10;
+    static u64 probe_addr = 0;
+    static std::vector<u64> probe_hashes;
+    if (probe_enabled.load(std::memory_order_relaxed) == 1 && top_addr == probe_addr &&
+        probe_hashes.size() == (image.info.guest_size + kChunk - 1) / kChunk) {
+        const u64 blocks = probe_hashes.size();
+        u64 changed = 0;
+        std::vector<u64> fresh(blocks);
+        for (u64 b = 0; b < blocks; ++b) {
+            const u64 off = b * kChunk;
+            const u64 size = std::min<u64>(kChunk, image.info.guest_size - off);
+            fresh[b] = BbMemory::HashBacking(top_addr + off, size);
+            changed += fresh[b] != probe_hashes[b];
+        }
+        probe_hashes = std::move(fresh);
+        BbStats::probe_chunks_total.fetch_add(blocks, std::memory_order_relaxed);
+        BbStats::probe_chunks_changed.fetch_add(changed, std::memory_order_relaxed);
+    } else if (probe_enabled.load(std::memory_order_relaxed) == 1 &&
+               top_addr != probe_addr) {
+        // First sight of (or a switch to) the dominant image: seed the baseline.
+        probe_addr = top_addr;
+        probe_hashes.clear();
+        const u64 blocks = (image.info.guest_size + kChunk - 1) / kChunk;
+        probe_hashes.reserve(blocks);
+        for (u64 b = 0; b < blocks; ++b) {
+            const u64 off = b * kChunk;
+            const u64 size = std::min<u64>(kChunk, image.info.guest_size - off);
+            probe_hashes.push_back(BbMemory::HashBacking(top_addr + off, size));
+        }
+    }
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,

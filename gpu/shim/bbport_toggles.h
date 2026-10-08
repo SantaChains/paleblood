@@ -108,6 +108,22 @@ inline std::atomic<std::uint64_t> t_resident{0}, t_protect{0}, t_image_create{0}
     /// g_bb_compiles is exchanged only at the 5-second summary, which would zero it.
     t_shader_compile{0},
     t_write_faults{0}, t_copy_cpu{0}, copy_sys_us{0}, copy_minflt{0};
+/// RefreshImage internals (ns): the detile pass and the upload submission, so the
+/// 5 s summary can split the refresh budget before choosing an optimization.
+inline std::atomic<std::uint64_t> t_refresh_detile{0}, t_refresh_upload{0};
+inline std::atomic<std::uint64_t> refresh_count{0};
+/// Top refresh consumers (guest address / uploaded bytes / hits): the 4+ GB per
+/// window of repeated uploads needs per-image attribution before any fix. 8 slots,
+/// first-match-wins with an empty-slot claim — diagnostics, race tolerant.
+inline std::atomic<std::uint64_t> refresh_top_addr[8]{};
+inline std::atomic<std::uint64_t> refresh_top_bytes[8]{};
+inline std::atomic<std::uint64_t> refresh_top_count[8]{};
+/// Chunk-change probe (BB_PROBE_CHUNKS=1): for the top repeat-uploader, hash 64 KiB
+/// blocks each refresh and count how many changed since the last one. The changed
+/// ratio decides between incremental upload (few dirty chunks) and leaving the full
+/// upload in place (the whole texture scrolls every frame). One-shot measurement.
+inline std::atomic<std::uint64_t> probe_chunks_total{0}, probe_chunks_changed{0};
+inline std::atomic<int> probe_chunks_enabled{-1};
 /// Diagnostics are collected only with BB_FRAME_STATS=1.
 inline const bool enabled = [] {
     const char* env = std::getenv("BB_FRAME_STATS");
