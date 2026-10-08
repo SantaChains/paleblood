@@ -463,6 +463,14 @@ static int state_line(FILE *f, char *file, size_t file_cap, char *mod, size_t mo
     snprintf(mod, mod_cap, "%s", tab + 1);
     return 1;
 }
+/* The file-name part of a mixed-separator path (state.txt records what an older
+ * session loaded; the directory may legitimately change between sessions). */
+static const char *path_tail(const char *p) {
+    const char *slash = strrchr(p, '/'), *back = strrchr(p, '\\');
+    if (back > slash) slash = back;
+    return slash ? slash + 1 : p;
+}
+
 static void load_state(void) {
     char path[1100];
     snprintf(path, sizeof path, "%s/state.txt", cheat_dir);
@@ -471,8 +479,12 @@ static void load_state(void) {
     char file[600], mod[600];
     while (state_line(f, file, sizeof file, mod, sizeof mod)) {
         CheatFile *cf = NULL;
+        /* Match by file name, not the recorded full path: the jsons live in the
+         * relocated directory (out/cheats) while a state written by an older session
+         * names the repo cheats/ directory — the intent (these mods were on) travels,
+         * the directory may not. */
         for (int i = 0; i < file_count && !cf; ++i)
-            if (!strcmp(files[i].path, file)) cf = &files[i];
+            if (!strcasecmp(path_tail(files[i].path), path_tail(file))) cf = &files[i];
         if (!cf) continue;
         if (!strcmp(mod, "M")) { cf->master_wanted = 1; continue; }
         for (int m = 0; m < cf->mod_count; ++m)
