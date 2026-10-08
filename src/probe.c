@@ -7,6 +7,7 @@
 #include <inttypes.h>
 #include "runtime.h"
 #include "runtime_cheats.h"
+#include "runtime_prof.h"
 #include "gpu/bbgpu.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
@@ -852,6 +853,8 @@ int main(int argc, char **argv) {
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
     if (!cpu_only) runtime_cheats_boot(cheat_serial, cheat_version);
+    if (getenv("BB_PROF"))
+        runtime_prof_start((uintptr_t)image, round_page(size)); /* guest RIP sampler */
 #ifdef _WIN32
     printf("Guest thread pointer reads: %" PRIu64 " use TEB TLS slot %u\n", patch_tls_reads(segments, ns), runtime_win_tls_slot());
 #endif

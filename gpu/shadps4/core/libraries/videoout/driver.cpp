@@ -331,6 +331,13 @@ void VideoOutDriver::Flip(const Request& req) {
         static Clock::time_point window_start = Clock::now(), last = window_start;
         static u32 frames;
         static double worst_ms;
+        // Wave budget accumulators (frame loop writes, the 5 s summary reads and clears):
+        // frames that miss the 90 Hz budget (11.1 ms) but stay under the stall line are
+        // the "instability" band; their seven-segment cost is summed per frame with the
+        // same deltas the Stall dump uses.
+        static u32 slow_frames;
+        static double slow_over_ms;
+        static u64 slow_seg[7];
         const auto now = Clock::now();
         const double frame_ms = std::chrono::duration<double, std::milli>(now - last).count();
         worst_ms = std::max(worst_ms, frame_ms);
@@ -431,6 +438,14 @@ void VideoOutDriver::Flip(const Request& req) {
         last_copy_bytes = copy_bytes;
         last_proc_flt = proc_flt;
         last_sigf = sigf;
+        // Wave budget: capture this frame's seven-segment cost when it lands in the
+        // instability band (the deltas span the last frame, so consecutive slow frames
+        // attribute their segment cost precisely).
+        if (frame_ms > 15.0 && frame_ms <= 40.0) {
+            ++slow_frames;
+            slow_over_ms += frame_ms - 1000.0 / 90.0;
+            for (int i = 0; i < 7; ++i) slow_seg[i] += t_now[i] - last_t[i];
+        }
         std::copy(std::begin(t_now), std::end(t_now), std::begin(last_t));
         last_draws = draws;
         last_dispatches = dispatches;
@@ -479,6 +494,33 @@ void VideoOutDriver::Flip(const Request& req) {
                         BbStats::tick_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
+            // Scene load: what the texture cache absorbed this window — new image
+            // registrations and upload bytes track scene transitions and streaming.
+            // Window-level deltas (the per-frame ones would show just the last frame).
+            static u64 window_images, window_image_bytes, window_buffer_bytes;
+            std::printf("Scene: %llu new images, %.0f MB texture uploads, %.0f MB buffer uploads\n",
+                        static_cast<unsigned long long>(images - window_images),
+                        (image_bytes - window_image_bytes) / 1e6,
+                        (buffer_bytes - window_buffer_bytes) / 1e6);
+            window_images = images;
+            window_image_bytes = image_bytes;
+            window_buffer_bytes = buffer_bytes;
+            // Wave budget: where the sub-stall slow frames spent their time (same
+            // seven segments as the Stall dump, averaged over the slow frames — the
+            // deltas were captured per frame, so consecutive slow frames attribute
+            // their cost precisely).
+            if (slow_frames) {
+                std::printf("Wave: %u slow frames (15-40 ms, %.0f ms over the 90 Hz budget); "
+                            "avg ms in: resident %.1f, protect %.1f, image create %.1f, "
+                            "refresh %.1f, staging %.1f, host copies %.1f, compile %.1f\n",
+                            slow_frames, slow_over_ms, slow_seg[0] / 1e6 / slow_frames,
+                            slow_seg[1] / 1e6 / slow_frames, slow_seg[2] / 1e6 / slow_frames,
+                            slow_seg[3] / 1e6 / slow_frames, slow_seg[4] / 1e6 / slow_frames,
+                            slow_seg[5] / 1e6 / slow_frames, slow_seg[6] / 1e6 / slow_frames);
+                slow_frames = 0;
+                slow_over_ms = 0;
+                std::fill(std::begin(slow_seg), std::end(slow_seg), 0);
+            }
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
             // 1% Low uses the industry reading — the mean flip time of the worst 1% (at least
             // one) frame, inverted — so it speaks the player's units. jank counts flips over

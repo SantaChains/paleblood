@@ -6,6 +6,7 @@
  * Priorities/affinity are recorded, not enforced by a PS4 scheduler. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "runtime_prof.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,6 +127,18 @@ void runtime_thread_attach_host(const char *name) {
 void runtime_thread_attach_main(void) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
+}
+int runtime_threads_snapshot(RuntimeThreadInfo *out, int max) {
+    int n=0;
+    host_lock(&lock);
+    for (GuestThread *it=threads; it && n<max; it=it->next) {
+        if (it->finished || !it->host) continue;
+        out[n].handle=(void *)it->host;
+        snprintf(out[n].name,sizeof(out[n].name),"%s",it->name);
+        ++n;
+    }
+    host_unlock(&lock);
+    return n;
 }
 /* Lockless membership probe for sections that already hold the lock: records are freed
  * on reap, so every handle dereference must share one lock section with the test. */
