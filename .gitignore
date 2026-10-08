@@ -11,7 +11,6 @@ user-presets.json
 user-presets.json.*
 fsr4_shaders/
 pgo/
-*.png
 last_run.log
 dist/
 packaging/runtime-paths.nix
@@ -66,4 +65,7 @@ result-*
 /dlss/
 /nvngx*.dll
 /patches-stamp.json
+/logo/bloodborne.png
 /logo/bg2.jpg
+/logo/bg3.png
+/logo/bg.png
