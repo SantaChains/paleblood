@@ -3,6 +3,8 @@
 
 #include <xxhash.h>
 
+#include <unordered_set>
+
 #include "bbport_memory_hash.h"
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
@@ -754,9 +756,17 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
                 return image_ids[i];
             }
         }
-        LOG_WARNING(Render_Vulkan,
-                    "Failed to find exact image match for copy addr={:#x}, size={:#x}", address,
-                    size);
+        // Scene transitions redefine surfaces and leave overlapping registrations behind;
+        // the same address+size then misses on every flip and the warning would flood the
+        // console (observed entering the boss fog gate). One report per address+size pair
+        // (first 64 pairs) is enough to diagnose an aliasing change.
+        static std::unordered_set<u64> warned;
+        const auto [_, inserted] = warned.emplace(address ^ size);
+        if (inserted && warned.size() <= 64) {
+            LOG_WARNING(Render_Vulkan,
+                        "Failed to find exact image match for copy addr={:#x}, size={:#x}",
+                        address, size);
+        }
     }
     return {};
 }
