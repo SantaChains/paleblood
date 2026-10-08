@@ -735,11 +735,23 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     ImageIds image_ids;
+    // Diagnostics for the multi-candidate miss below: candidate sizes and how many were
+    // filtered by SafeToDownload. If an exact-size candidate exists but is filtered, the
+    // buffer fallback reads guest memory the GPU may not have written back yet (a ghosting
+    // class of error, the domain of upstream's "precise readbacks"); the log distinguishes
+    // that from the benign "the exact-size image was never registered" case.
+    u32 filtered_unsafe = 0;
+    bool exact_registered = false;
+    std::string candidate_sizes;
     ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
         if (image.info.guest_address != address) {
             return;
         }
+        candidate_sizes += fmt::format(" {:#x}{}", image.info.guest_size,
+                                       image.SafeToDownload() ? "" : "!");
+        exact_registered |= image.info.guest_size == size;
         if (ensure_valid && !image.SafeToDownload()) {
+            ++filtered_unsafe;
             return;
         }
         image_ids.push_back(image_id);
@@ -764,8 +776,10 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
         const auto [_, inserted] = warned.emplace(address ^ size);
         if (inserted && warned.size() <= 64) {
             LOG_WARNING(Render_Vulkan,
-                        "Failed to find exact image match for copy addr={:#x}, size={:#x}",
-                        address, size);
+                        "Failed to find exact image match for copy addr={:#x}, size={:#x}; "
+                        "candidates (size, '!' = not safe to download):{}, exact registered: {}, "
+                        "filtered as unsafe: {}",
+                        address, size, candidate_sizes, exact_registered, filtered_unsafe);
         }
     }
     return {};
