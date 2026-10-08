@@ -902,6 +902,7 @@ void TextureCache::RefreshImage(Image& image) {
 
     const u32 num_layers = image.info.resources.layers;
     const u32 num_mips = image.info.resources.levels;
+    const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
     BbStats::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
@@ -922,17 +923,16 @@ void TextureCache::RefreshImage(Image& image) {
         // character creation preview went black after one frame).
         const u64 mip_hash =
             BbMemory::HashBacking(image.info.guest_address + mip_offset, mip_size);
-        // bbport: a CPU write whose value equals what was last uploaded changes nothing
-        // the GPU can see — the water surface's animated parameters rewrite the same
-        // bytes every frame (measured: 0/12096 64 KiB chunks changed across windows),
-        // and each write fault marked the 11.4 MB image CpuDirty for a full re-upload.
-        // The per-mip hash is that check, unconditionally: equal bytes mean the copy
-        // carries no information, and when the GPU also wrote this image (its compute
-        // pass re-generates the water surface every frame, setting GpuDirty) keeping
-        // the GPU's version is exactly what the equality allows.
-        if (image.mip_hashes[m] == mip_hash) {
+        if (is_gpu_modified && !is_gpu_dirty && image.mip_hashes[m] == mip_hash) {
             continue;
         }
+        // bbport (REVERTED experiment): skipping on hash equality alone removed the
+        // 11.4 MB/frame repeat upload of the water surface's parameter texture but
+        // broke the water in play (missing surface, stray light source, one freeze) —
+        // the chunk probe reads the backing view, which evidently does not observe
+        // what actually feeds the GPU for this image, so "0% changed" was measuring
+        // the wrong memory. The measurement stays; the optimization waits for a
+        // tracker that watches the real write path.
         image.mip_hashes[m] = mip_hash;
 
         const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
