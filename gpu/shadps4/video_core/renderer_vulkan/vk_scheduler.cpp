@@ -463,7 +463,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         // process can still write. std::printf goes through the launcher's unbuffered stderr.
         const auto mem = instance.GetDeviceMemoryStatus();
         const u32 compiles = Vulkan::g_bb_compiles.load(std::memory_order_relaxed);
-        std::printf(
+        // fmt::format, not printf: {:.1f} placeholders are fmt-style and printf would
+        // print them literally (first device-lost run proved it the hard way).
+        const auto dump = fmt::format(
             "Device lost diagnostics: memory usage {:.1f} MB / budget {:.1f} MB, "
             "compiles pending {}, shader compile total {:.1f} ms, draw {}, dispatch {}, "
             "tick wait total {:.1f} ms, host copies wait total {:.1f} ms\n",
@@ -473,6 +475,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
             BbStats::dispatches.load(std::memory_order_relaxed),
             BbStats::tick_wait_ns.load(std::memory_order_relaxed) / 1e6,
             BbStats::host_copies_wait_ns.load(std::memory_order_relaxed) / 1e6);
+        std::fputs(dump.c_str(), stdout);
         std::fflush(stdout);
     }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
