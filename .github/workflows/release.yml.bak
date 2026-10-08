@@ -1,0 +1,126 @@
+# 自动发版：VERSION 文件的版本号变化时（含中间数字），构建 Windows 包并发布 Release。
+#
+# 机制：仓库根的 VERSION 文件是唯一版本来源。push 后读取它，tag v<VERSION> 不存在
+# 就构建、打 tag、发 Release；已存在则整个 job 跳过——也就是说，改一次 VERSION 的
+# 中间数字推上来，就自动出一次版；其余 push 一律跳过，不耗机器时间。
+#
+# 手动构建不发布：Actions -> release -> Run workflow 勾选 upload-artifact-only。
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      upload_artifact_only:
+        description: '只上传构建产物，不发 Release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # tag 与 release 上传
+
+env:
+  VERSION_FILE: VERSION
+  # FindVulkan.cmake 在 MSYS2 shell 里没有 SDK 环境变量可循；clang64 的头与
+  # loader 布局（include/vulkan、lib/libvulkan.dll.a）正好符合 VULKAN_SDK 约定。
+  VULKAN_SDK: /clang64
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      tag: ${{ steps.read.outputs.tag }}
+      should_release: ${{ steps.check.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 查询远程 tag
+      - id: read
+        run: |
+          version="$(tr -d '[:space:]' < "$VERSION_FILE")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+      - id: check
+        run: |
+          if git ls-remote --tags origin "refs/tags/${{ steps.read.outputs.tag }}" | grep -q .; then
+            echo "tag ${{ steps.read.outputs.tag }} 已存在：跳过发版" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "发版 ${{ steps.read.outputs.tag }}" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows:
+    needs: version
+    if: needs.version.outputs.should_release == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 与本地 build.bat 相同的 CLANG64 工具链：clang/cmake/ninja/python/pkg-config，
+      # 加 gpu/CMakeLists.txt 经 find_program 与 pkg-config 找到的头文件与库
+      # （glslang 编译 compute shader、vma 分配器、boost asio、SDL3 窗口后端）。
+      # 包名已逐个经 pacman -Si 校验（CLANG64 仓库）：glslang 带完整前缀、SDL3 是小写
+      # sdl3；clang 包自带 lld 与 llvm-tools（windres 在其中），无需 toolchain 组。
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: false
+          install: >-
+            make
+            git
+            clang
+            cmake
+            ninja
+            python
+            pkgconf
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-boost
+            mingw-w64-clang-x86_64-vulkan-headers
+            mingw-w64-clang-x86_64-vulkan-loader
+            mingw-w64-clang-x86_64-vulkan-memory-allocator
+            mingw-w64-clang-x86_64-fmt
+            mingw-w64-clang-x86_64-robin-map
+            mingw-w64-clang-x86_64-zydis
+            mingw-w64-clang-x86_64-xxhash
+            mingw-w64-clang-x86_64-ffmpeg
+            mingw-w64-clang-x86_64-glslang
+            mingw-w64-clang-x86_64-sdl3
+
+      - name: Build
+        run: |
+          # clang64 的 cmake（Windows 语义，WIN32=true）必须压过 /usr/bin 的 msys 版：
+          # msys cmake 走 else（Linux）分支，会去 REQUIRED X11 而不是 FetchContent。
+          command -v cmake
+          ./build.sh
+
+      - name: Collect release payload
+        run: python tools/make_release.py --version "${{ needs.version.outputs.version }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bbport-${{ needs.version.outputs.version }}-win64
+          path: out/release/bbport-*-win64.zip
+
+      - name: Tag
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "release-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git tag "${{ needs.version.outputs.tag }}"
+          git push origin "${{ needs.version.outputs.tag }}"
+
+      - name: Publish release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          files: out/release/bbport-*-win64.zip
+          body_path: RELEASE.zh.md
+          fail_on_unmatched_files: true
