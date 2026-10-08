@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/small_vector.hpp>
+#include <unordered_set>
 #include "bbport_toggles.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -55,9 +56,17 @@ static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_in
     // If the image type is equal, layer count must match. Take the minimum of both.
     if (vk_src_type == vk_dst_type) {
         if (src_layers != dst_layers) {
-            LOG_WARNING(Render_Vulkan,
-                        "Coercing copy source layers {} and destination layers {} to minimum.",
-                        src_layers, dst_layers);
+            // Scene transitions re-allocate texture arrays and copy the old contents in;
+            // the min coercion is exactly the game's intent (new layers are filled by the
+            // game afterwards). One report per layer pair keeps the console readable while
+            // the first occurrence still documents the reallocation.
+            static std::unordered_set<u64> warned;
+            const auto [_, inserted] = warned.emplace(u64(src_layers) << 32 | dst_layers);
+            if (inserted && warned.size() <= 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "Coercing copy source layers {} and destination layers {} to minimum.",
+                            src_layers, dst_layers);
+            }
             src_layers = dst_layers = std::min(src_layers, dst_layers);
         }
     } else {
