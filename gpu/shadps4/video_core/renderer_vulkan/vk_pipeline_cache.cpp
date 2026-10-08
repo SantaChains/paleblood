@@ -13,6 +13,7 @@
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "bbport_toggles.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -362,9 +363,13 @@ namespace {
 struct CompileTimer {
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     ~CompileTimer() {
-        g_bb_compile_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                   std::chrono::steady_clock::now() - start)
-                                   .count());
+        const auto ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+        g_bb_compile_ns += ns;
+        // Stall 帧归因用（BbStats 差值法）：compile 在 GPU 命令线程同步执行，雾门一类
+        // 场景切换时它曾以 ~130 ms 藏在 Stall 分解的"无归因"盲区里。
+        BbStats::t_shader_compile.fetch_add(ns, std::memory_order_relaxed);
         ++g_bb_compiles;
     }
 };

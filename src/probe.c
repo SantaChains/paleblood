@@ -636,6 +636,9 @@ int main(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    // stderr is redirected to a file by the launcher: unbuffered, or a STOP/crash message
+    // dies with the process's buffer and a silent-exit report becomes unreproducible.
+    setvbuf(stderr, NULL, _IONBF, 0);
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
     int cpu_only = 0, strict_imports = 0;
     unsigned timeout_seconds = 10;

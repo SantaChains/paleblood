@@ -103,6 +103,10 @@ inline std::atomic<std::uint64_t> gpu_frames{0};
 /// Wall time spent in operations suspected of stalls (ns, all threads).
 inline std::atomic<std::uint64_t> t_resident{0}, t_protect{0}, t_image_create{0}, t_refresh{0},
     t_staging{0}, t_host_wait{0}, t_copy{0}, copy_bytes{0}, t_read_faults{0}, read_faults{0},
+    /// Shader/pipeline compile time (ns, all threads; the GPU command thread in practice).
+    /// Mirrors Vulkan::g_bb_compile_ns so the Stall breakdown can report a per-frame delta:
+    /// g_bb_compiles is exchanged only at the 5-second summary, which would zero it.
+    t_shader_compile{0},
     t_write_faults{0}, t_copy_cpu{0}, copy_sys_us{0}, copy_minflt{0};
 /// Diagnostics are collected only with BB_FRAME_STATS=1.
 inline const bool enabled = [] {
