@@ -516,7 +516,18 @@ const char *bbcheats_toggle(int file, int mod, int enable) {
     if (m->enabled == (enable != 0)) return NULL;
     if (!enable && bbcheats_mod_one_way(file, mod))
         return "one-way code: restart the game to revert it";
-    const char *error = write_entries(m->writes, m->write_count, enable);
+    const char *error = NULL;
+    if (enable && cf->master_count && !cf->master_applied) {
+        /* GoldHEN semantics: mods jump into cave code the master writes. Enabling a mod
+         * without the master would leave its hook targeting a cave that still holds raw
+         * game bytes. Pull the master in first (its cave bodies land before this mod's
+         * hook), and record it so the boot replay and the menu checkbox agree. */
+        error = write_entries(cf->master, cf->master_count, 1);
+        if (error) return error;
+        cf->master_applied = 1;
+        cf->master_wanted = 1;
+    }
+    error = write_entries(m->writes, m->write_count, enable);
     if (error) return error;
     m->enabled = enable != 0;
     save_state();
